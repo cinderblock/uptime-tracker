@@ -1,0 +1,78 @@
+# Copy to `wrangler.toml` and fill in. The real file is gitignored — it holds
+# your account-specific resource IDs.
+#
+#   cp wrangler.toml.example wrangler.toml
+#
+# Create the resources first:
+#   wrangler d1 create UPTIME_DB          # copy the returned database_id below
+#   wrangler kv namespace create KV       # copy the returned id below
+#   bun run migrate
+
+name = "uptime"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+upload_source_maps = true
+
+# ── Plan profile ─────────────────────────────────────────────────────────────
+#
+# PLAN=paid  — Workers Paid ($5/mo). Every-minute checks, aggregates kept in
+#              large KV blobs so the dashboard read path never touches D1
+#              (paid D1 bills per row *scanned*).
+#
+# PLAN=free  — Workers Free ($0/mo). Fits inside 10 ms CPU/invocation,
+#              1,000 KV writes/day, 100,000 D1 rows written/day, and
+#              50 subrequests/invocation. Aggregates live in D1 and KV is
+#              written only when state actually changes.
+#
+# The two are NOT the same code path with different numbers — the free plan's
+# 10 ms CPU ceiling can't absorb the megabyte-scale JSON round-trip the paid
+# profile does each tick. See src/plan.ts.
+#
+# Keep CRON_INTERVAL_MINUTES in sync with [triggers] below; cache TTLs and
+# per-day budgets are derived from it.
+
+[triggers]
+crons = ["* * * * *"] # paid: every minute.  free: use "*/5 * * * *"
+
+[vars]
+PLAN = "paid"
+CRON_INTERVAL_MINUTES = "1" # free: "5"
+
+# Concurrency pool: "max periodMs start increment" — ramp from `start` to `max`,
+# adding `increment` slots every `periodMs`. Ramping avoids hammering your own
+# origin with a burst of simultaneous connections.
+CHECK_CONCURRENCY = "25" # free: "6" (free plan allows 6 simultaneous connections)
+
+# Optional: hard cap on outbound checks launched per tick. Defaults to the
+# profile's budget. On free this must stay under the 50-subrequest ceiling with
+# room for GitHub polling and push delivery.
+# CHECK_BUDGET = "30"
+
+# ── Web Push (optional) ──────────────────────────────────────────────────────
+# Generate a keypair:  bunx web-push generate-vapid-keys
+# The PUBLIC key is safe to commit; the PRIVATE key is a secret.
+#   wrangler secret put VAPID_PRIVATE_KEY
+VAPID_PUBLIC_KEY = ""                        # base64url 65-byte uncompressed P-256 point
+VAPID_SUBJECT = "mailto:you@example.com"     # mailto: or https:// identifying the sender
+
+# ── Cost monitor (optional) ──────────────────────────────────────────────────
+# Polls Cloudflare's GraphQL Analytics API hourly to track your own usage/spend.
+# Leave CF_ACCOUNT_ID empty to disable the whole feature.
+#   wrangler secret put CF_ANALYTICS_TOKEN   # needs Account Analytics:Read
+CF_ACCOUNT_ID = ""
+
+# ── Secrets (never put these here — use `wrangler secret put <NAME>`) ────────
+# DASHBOARD_PASSWORD  Passphrase gating the dashboard. UNSET = PUBLIC DASHBOARD.
+# AUTH_SECRET         Random string signing auth cookies. Required with the above.
+# VAPID_PRIVATE_KEY   Web Push signing key.
+# GITHUB_TOKEN        Only needed for private repos in the workflow badges panel.
+# CF_ANALYTICS_TOKEN  Cost monitor.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "UPTIME_DB"
+database_id = "" # from `wrangler d1 create UPTIME_DB`
+
+[[kv_namespaces]]
+binding = "KV"
+id = "" # from `wrangler kv namespace create KV`

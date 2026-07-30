@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2021",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["@cloudflare/workers-types"],
+    "lib": ["ES2021"],
+    "noEmit": true
+  },
+  // dev.ts is deliberately excluded: it imports `bun`, which pulls in Node's
+  // global types and conflicts with @cloudflare/workers-types (crypto.subtle
+  // in particular). It runs under bun, which typechecks it on its own.
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules"]
+}

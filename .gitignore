@@ -1,0 +1,15 @@
+node_modules/
+.wrangler/
+
+# Deployment-specific — copy the .example files and fill them in.
+# These carry your account IDs, hostnames, and monitored services.
+wrangler.toml
+wrangler.resolved.toml
+src/config.ts
+
+# Secrets
+.dev.vars
+.prod-secrets
+.env
+.env.*
+!.env.example
