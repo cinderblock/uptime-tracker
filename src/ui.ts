@@ -1,5 +1,6 @@
 import type { DashboardConfig, GitHubWorkflowConfig, LabelDefinition, PanelStatus, ServiceStatus } from './types';
 import { config } from './config';
+import type { PlanProfile } from './plan';
 import type { ChartData, DdnsLogEntry, UptimeByPeriod } from './storage';
 import { renderCostPanelHtml, COST_PANEL_CSS, type CostPanelData } from './cost/ui';
 
@@ -71,6 +72,7 @@ function renderGitHubPanel(workflows: GitHubWorkflowConfig[], showBells: boolean
 
 /** Render the dashboard */
 export function renderDashboard(
+  plan: PlanProfile,
   config: DashboardConfig,
   status: { panels: PanelStatus[]; lastUpdate: number | null },
   ddnsLog: DdnsLogEntry[] = [],
@@ -973,7 +975,10 @@ export function renderDashboard(
     // Poll for updates. Lightweight polls fetch status + ddns only (~50KB).
     // Full polls also include uptime + log-decimated charts (30d) and run every 5 minutes.
     let lastFullPoll = inlineCharts ? Date.now() : 0;
-    const FULL_POLL_INTERVAL = 5 * 60 * 1000; // 5 minutes
+    // How often a poll also refreshes charts. On free this is the dominant
+    // read cost — a full poll is the ~6,000-row dashboard query, a light one
+    // is a single blob row — so it comes from the plan profile.
+    const FULL_POLL_INTERVAL = ${plan.clientFullPollMs};
 
     function poll() {
       const needsFull = Date.now() - lastFullPoll >= FULL_POLL_INTERVAL;
@@ -1519,7 +1524,8 @@ export function renderDashboard(
       renderTimeline(transitions);
     };
 
-    // Adaptive polling: 5s until data arrives, then 30s
+    // Adaptive polling: 5s until data arrives, then the plan's steady interval.
+    const POLL_INTERVAL = ${plan.clientPollMs};
     let hasData = ${lastUpdate !== null};
     let pollTimer = null;
 
@@ -1530,20 +1536,20 @@ export function renderDashboard(
           applyFilter();
           if (!hasData && gotData) {
             hasData = true;
-            startPolling(30000);
+            startPolling(POLL_INTERVAL);
           }
         });
       }, interval);
     }
 
-    // Start polling: 30s if we have data, 5s rapid-poll until first data arrives.
+    // Steady interval once we have data, 5s rapid-poll until the first arrives.
     // Chart data arrives via stream or inline — no need for an initial full poll.
     if (hasData) {
-      startPolling(30000);
+      startPolling(POLL_INTERVAL);
     } else {
       poll().then(gotData => {
         hasData = gotData;
-        startPolling(hasData ? 30000 : 5000);
+        startPolling(hasData ? POLL_INTERVAL : 5000);
       });
     }
 

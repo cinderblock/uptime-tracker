@@ -1275,7 +1275,7 @@ async function handleDashboard(env: Env, plan: PlanProfile): Promise<Response> {
   ]);
   const merged = mergeConfigWithStatus(cached);
 
-  const html = renderDashboard(config, merged, ddnsLog, env.VAPID_PUBLIC_KEY, uptime, undefined, costData);
+  const html = renderDashboard(plan, config, merged, ddnsLog, env.VAPID_PUBLIC_KEY, uptime, undefined, costData);
 
   // Stream: send HTML immediately, then append chart data when ready
   const encoder = new TextEncoder();
