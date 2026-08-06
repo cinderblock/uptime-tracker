@@ -223,8 +223,16 @@ which case the panel stays hidden and no DDNS alerting runs.
 
 ```bash
 bun run dev        # wrangler dev against your real remote bindings
+bun run test       # unit tests (bun test)
 bun run typecheck
 ```
+
+The tests cover the parts where a mistake is silent rather than loud: session
+token signing and expiry, the plan profiles and their env overrides, and the
+shipped migration SQL run against real SQLite — including that the errors query
+uses its index, and that the paid → free rollup backfill respects retention and
+is idempotent. `bun run test` seeds `src/config.ts` from the example first if
+you don't have one yet.
 
 `bun run dev` resolves the D1/KV names in `wrangler.toml` to real IDs via the
 wrangler CLI, so you can keep names rather than IDs in config. Run
