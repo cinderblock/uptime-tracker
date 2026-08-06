@@ -79,6 +79,13 @@ load scans roughly 6,000 D1 rows. See
 [`migrations/0009_free_plan_rollups.sql`](migrations/0009_free_plan_rollups.sql)
 and [`src/storage-free.ts`](src/storage-free.ts).
 
+One consequence worth knowing: chart resolution differs. The paid tiers keep
+1/10/30/120-minute buckets for the primary HTTPS URL of each service. On free,
+anything older than 6 hours comes from the hourly rollup, which has no URL or
+type dimension — so an hour in which _any_ of a service's checks failed paints
+that hour as down. Uptime percentages are unaffected; they count all results on
+both plans.
+
 **Free-plan sizing.** The 10 ms CPU ceiling is the real constraint, and it scales
 with how much you monitor. Roughly 15 services / 25 check URLs is comfortable;
 past that, either raise the cron interval or move to the paid plan. The worker
@@ -176,6 +183,12 @@ repos need no credentials; private repos need `wrangler secret put GITHUB_TOKEN`
 **Cost monitor** — set `CF_ACCOUNT_ID` in `wrangler.toml` and
 `wrangler secret put CF_ANALYTICS_TOKEN` (a Cloudflare API token with
 _Account Analytics: Read_). Leave `CF_ACCOUNT_ID` empty to disable it entirely.
+
+**Usage ingest** — apps can `POST /api/usage` to report their own spend (LLM
+tokens etc.) so it shows in the cost panel. It's exempt from the dashboard
+session cookie, since reporting apps aren't browsers, and carries its own
+`Authorization: Bearer $USAGE_TOKEN` instead. Unset, the endpoint returns 503 —
+it writes to the database, so it is never left open.
 
 **DDNS log** — the worker reads a `ddns_log` table that something else writes.
 Any dynamic-DNS updater that can insert rows into the same D1 database works;

@@ -12,11 +12,21 @@
  *      ts?: number                     // optional ms-epoch override (default: now)
  *    }
  *
- *  No auth: apps shouldn't need a token to report their own spend. Abuse is
- *  bounded by Cloudflare's per-request rate limits at the zone level.
+ *  Auth: `Authorization: Bearer $USAGE_TOKEN`. This endpoint is exempt from the
+ *  dashboard's session cookie — reporting apps are not browsers and have no way
+ *  to log in — so it carries its own token instead. When USAGE_TOKEN is unset
+ *  the endpoint is disabled outright rather than left open: it writes to the
+ *  database, and an unauthenticated writer on a public URL is a spend-inflation
+ *  vector, not merely noise.
+ *
+ *  (Earlier revisions documented this as unauthenticated while it in fact sat
+ *  behind the cookie gate, so it answered reporting apps with a login page.
+ *  Neither half of that was intended.)
  *
  *  Response:
  *    200 { ok: true, cost_micros, cost_usd, model, provider }
+ *    401 when the bearer token is missing or wrong
+ *    503 when USAGE_TOKEN is not configured
  *    400 on invalid payload or unknown model
  *    500 on storage failure (caller can retry; cost is rounded so duplicates
  *        slightly inflate spend — design accepts this) */

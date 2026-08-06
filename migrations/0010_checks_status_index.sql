@@ -1,0 +1,21 @@
+-- Index for the errors view.
+--
+-- `getRecentErrors` asks for the most recent N failures:
+--
+--   SELECT ... FROM checks WHERE status = 'down' ORDER BY timestamp DESC LIMIT 100
+--
+-- With only idx_checks_timestamp available, SQLite walks the timestamp index
+-- newest-first and discards every row whose status isn't 'down'. The healthier
+-- the deployment, the more it walks — a fleet with no recent outages scans the
+-- whole retention window to return an empty page. D1 bills rows *scanned*, and
+-- the free plan allows 5M/day, so the failure mode is "the errors page is
+-- cheapest when everything is broken", which is exactly backwards.
+--
+-- A composite index seeks straight to the 'down' rows and walks them in
+-- timestamp order, so the scan is bounded by the LIMIT instead of by table size.
+--
+-- Costs write amplification on every check insert. That's the right trade: at
+-- free-plan volumes (~7k inserts/day) it's a rounding error against the
+-- 100k rows/day write budget, while the read saving is unbounded.
+
+CREATE INDEX idx_checks_status_timestamp ON checks(status, timestamp DESC);

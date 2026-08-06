@@ -824,10 +824,18 @@ export async function refreshDdnsCache(
 }
 
 /** Get recent check errors (status = 'down'), optionally filtered by service */
+/** Most recent failures, newest first.
+ *
+ *  Bounded two ways on purpose: the composite (status, timestamp) index from
+ *  migration 0010 keeps the scan proportional to `limit` rather than to table
+ *  size, and `sinceDays` caps it even if the planner picks a different index.
+ *  Without either, a healthy deployment scans its whole retention window to
+ *  render an empty errors page — D1 bills rows scanned. */
 export async function getRecentErrors(
   db: D1Database | undefined,
   service?: string,
   limit = 100,
+  sinceDays = 30,
 ): Promise<
   {
     service: string;
@@ -842,16 +850,17 @@ export async function getRecentErrors(
 > {
   if (!db) return [];
 
+  const since = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
   const query = service
     ? `SELECT service, url, type, code, error, latency, source, timestamp
-       FROM checks WHERE status = 'down' AND service = ?
+       FROM checks WHERE status = 'down' AND timestamp > ? AND service = ?
        ORDER BY timestamp DESC LIMIT ?`
     : `SELECT service, url, type, code, error, latency, source, timestamp
-       FROM checks WHERE status = 'down'
+       FROM checks WHERE status = 'down' AND timestamp > ?
        ORDER BY timestamp DESC LIMIT ?`;
 
   const stmt = db.prepare(query);
-  const bound = service ? stmt.bind(service, limit) : stmt.bind(limit);
+  const bound = service ? stmt.bind(since, service, limit) : stmt.bind(since, limit);
 
   const results = await bound.all<{
     service: string;

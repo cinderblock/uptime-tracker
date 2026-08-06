@@ -340,4 +340,7 @@ export interface Env {
   /** Random string used to sign auth cookies (secret — wrangler secret put).
    *  Required whenever DASHBOARD_PASSWORD is set. */
   AUTH_SECRET?: string;
+  /** Bearer token for POST /api/usage (secret — wrangler secret put). Unset
+   *  disables the endpoint; it is never open, since it writes to the database. */
+  USAGE_TOKEN?: string;
 }

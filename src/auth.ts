@@ -130,8 +130,42 @@ const PUBLIC_PATHS = new Set([
   '/icon-192.png',
   '/icon-512.png',
   '/login',
+  // Exempt from the session cookie, but NOT unauthenticated — it carries its
+  // own bearer token. See verifyUsageToken and cost/push-handler.ts.
+  '/api/usage',
 ]);
 
 export function isPublicPath(pathname: string): boolean {
   return PUBLIC_PATHS.has(pathname);
+}
+
+/**
+ * Bearer-token check for the usage ingest endpoint.
+ *
+ * Returns null when authorised, or the Response to send back otherwise.
+ * Refuses when unconfigured rather than defaulting to open — this endpoint
+ * writes to the database.
+ */
+export async function verifyUsageToken(env: Env, request: Request): Promise<Response | null> {
+  const expected = env.USAGE_TOKEN;
+  if (!expected) {
+    return new Response(JSON.stringify({ error: 'usage ingest not configured (set USAGE_TOKEN)' }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+  const header = request.headers.get('Authorization') ?? '';
+  const presented = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(presented)),
+    crypto.subtle.digest('SHA-256', enc.encode(expected)),
+  ]);
+  if (!timingSafeEqual(new Uint8Array(a), new Uint8Array(b))) {
+    return new Response(JSON.stringify({ error: 'unauthorized' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+  return null;
 }

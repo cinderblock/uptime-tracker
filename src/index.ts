@@ -19,6 +19,7 @@ import {
   isPublicPath,
   verifyPassword,
   verifyToken,
+  verifyUsageToken,
 } from './auth';
 import { runAllChecks, runBudgetedChecks, parseConcurrency } from './checks';
 import { ddnsCacheTtlSeconds, isNthTick, resolvePlan, type PlanProfile } from './plan';
@@ -367,8 +368,11 @@ export default {
           // Browser submitting check results
           return handleApiProbe(request, env, ctx);
 
-        case '/api/usage':
-          return handleApiUsage(request, env);
+        case '/api/usage': {
+          // Cookie-exempt (reporting apps aren't browsers) but token-gated.
+          const denied = await verifyUsageToken(env, request);
+          return denied ?? handleApiUsage(request, env);
+        }
 
         case '/api/cost':
           return handleApiCost(env);
@@ -1384,7 +1388,7 @@ async function handleApiProbe(request: Request, env: Env, ctx: ExecutionContext)
 /** API: Get recent check errors */
 async function handleApiErrors(url: URL, env: Env): Promise<Response> {
   const service = url.searchParams.get('service') ?? undefined;
-  const errors = await getRecentErrors(env.DB, service);
+  const errors = await getRecentErrors(env.DB, service, 100, resolvePlan(env).historyRetentionDays);
   return jsonResponse({ errors });
 }
 
@@ -1688,7 +1692,7 @@ async function handleSubscriptionsPage(env: Env): Promise<Response> {
 /** Render the errors page */
 async function handleErrorsPage(url: URL, env: Env): Promise<Response> {
   const service = url.searchParams.get('service') ?? undefined;
-  const errors = await getRecentErrors(env.DB, service);
+  const errors = await getRecentErrors(env.DB, service, 100, resolvePlan(env).historyRetentionDays);
 
   const rows = errors
     .map(e => {
