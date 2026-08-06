@@ -327,6 +327,11 @@ export interface Env {
   CRON_INTERVAL_MINUTES?: string;
   /** Override the profile's per-tick outbound check budget. */
   CHECK_BUDGET?: string;
+  /** Days of raw check history to keep. Overrides the profile default (paid 30,
+   *  free 7). Lowering this DELETES history past the new window on the next
+   *  cleanup tick — set it explicitly before switching plans if you want to keep
+   *  more than the target profile's default. */
+  HISTORY_RETENTION_DAYS?: string;
 
   // ── Auth ───────────────────────────────────────────────────────────────────
   /** Shared passphrase gating the dashboard (secret — wrangler secret put).

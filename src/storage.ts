@@ -632,9 +632,25 @@ export async function updateTransitions(
   const d1 = useD1(plan);
   if (observations.length === 0) return;
   if (d1 ? !db : !kv) return;
-  const raw = d1 ? await blobGet(db, KV_TRANSITIONS_KEY) : ((await kv?.get(KV_TRANSITIONS_KEY)) ?? null);
-  const state: TransitionsState = raw ? (JSON.parse(raw) as TransitionsState) : {};
+  let raw = d1 ? await blobGet(db, KV_TRANSITIONS_KEY) : ((await kv?.get(KV_TRANSITIONS_KEY)) ?? null);
   let changed = false;
+
+  // Plan switch carry-over. The timeline is forward-only and has no `checks`
+  // table to rebuild from — unlike charts and uptime, which self-backfill — so
+  // switching plans would otherwise silently reset it to empty. If the active
+  // store has nothing, adopt whatever the other store holds and mark dirty so
+  // it lands in the new home this tick. Runs once: after the carry the active
+  // store is populated and this branch is never taken again.
+  if (raw === null) {
+    const carried = d1 ? ((await kv?.get(KV_TRANSITIONS_KEY)) ?? null) : await blobGet(db, KV_TRANSITIONS_KEY);
+    if (carried !== null) {
+      console.log(`Carrying transition timeline into ${d1 ? 'D1 blobs' : 'KV'} after plan switch`);
+      raw = carried;
+      changed = true;
+    }
+  }
+
+  const state: TransitionsState = raw ? (JSON.parse(raw) as TransitionsState) : {};
 
   for (const obs of observations) {
     const lane = state[obs.key];

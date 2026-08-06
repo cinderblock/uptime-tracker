@@ -205,7 +205,7 @@ async function ensureFreshData(request: Request, env: Env, plan: PlanProfile): P
   await saveCurrentStatus(plan, env.KV, env.DB, panels, lastCheckedTimes);
   await updateChartTiered(plan, env.KV, env.DB, allResults);
   await updateUptimeBuckets(plan, env.KV, env.DB, allResults);
-  if (plan.aggregateStore === 'd1') await rollUpHourly(env.DB, allResults);
+  if (plan.aggregateStore === 'd1') await rollUpHourly(env.DB, allResults, plan.historyRetentionDays);
   console.log(`[dev] Completed ${allResults.length} checks`);
 }
 
@@ -520,7 +520,7 @@ export default {
       await Promise.all([
         updateChartTiered(plan, env.KV, env.DB, allResults),
         updateUptimeBuckets(plan, env.KV, env.DB, allResults),
-        plan.aggregateStore === 'd1' ? rollUpHourly(env.DB, allResults) : Promise.resolve(),
+        plan.aggregateStore === 'd1' ? rollUpHourly(env.DB, allResults, plan.historyRetentionDays) : Promise.resolve(),
       ]);
 
       // Update last-checked times with fresh results, then save status + times to KV (single write)

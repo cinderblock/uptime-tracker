@@ -48,6 +48,12 @@ CHECK_CONCURRENCY = "25" # free: "6" (free plan allows 6 simultaneous connection
 # room for GitHub polling and push delivery.
 # CHECK_BUDGET = "30"
 
+# Optional: days of raw check history to keep. Defaults to 30 (paid) / 7 (free).
+# LOWERING THIS DELETES history past the new window on the next cleanup tick —
+# including implicitly, by switching PLAN from paid to free. See the README's
+# "Switching plans" section.
+# HISTORY_RETENTION_DAYS = "30"
+
 # ── Web Push (optional) ──────────────────────────────────────────────────────
 # Generate a keypair:  bunx web-push generate-vapid-keys
 # The PUBLIC key is safe to commit; the PRIVATE key is a secret.

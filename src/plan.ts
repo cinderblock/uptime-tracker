@@ -121,6 +121,8 @@ export function resolvePlan(env: Env): PlanProfile {
       parsePositiveInt(env.CRON_INTERVAL_MINUTES, 'CRON_INTERVAL_MINUTES') ?? base.cronIntervalMinutes,
     checkBudget: parsePositiveInt(env.CHECK_BUDGET, 'CHECK_BUDGET') ?? base.checkBudget,
     checkConcurrency: env.CHECK_CONCURRENCY ?? base.checkConcurrency,
+    historyRetentionDays:
+      parsePositiveInt(env.HISTORY_RETENTION_DAYS, 'HISTORY_RETENTION_DAYS') ?? base.historyRetentionDays,
   };
 }
 

@@ -89,6 +89,28 @@ checked longest ago, so nothing starves.
 See [`src/plan.ts`](src/plan.ts) for every knob and its reasoning. Individual
 values can be overridden with env vars without leaving a profile.
 
+### Switching plans
+
+Change `PLAN`, update `[triggers]` and `CRON_INTERVAL_MINUTES` to match, and
+redeploy. Derived state carries over on the first cron tick after the switch —
+charts and uptime rebuild from the `checks` table, and the event timeline is
+copied between stores. You do not need to migrate anything by hand.
+
+Two things to know before switching:
+
+**Free → paid recovers only what free kept.** Charts and uptime rebuild from raw
+check history, and the free profile retains 7 days of it, so that's how far back
+the rebuilt 30-day view reaches. It fills forward from there. If you plan to
+upgrade and want the history, set `HISTORY_RETENTION_DAYS` higher _while still on
+free_ — free D1 allows 500 MB per database, far more than a small deployment
+needs, and the 7-day default is about keeping query scans cheap rather than
+saving space.
+
+**Paid → free prunes history.** Retention drops 30 days → 7, and the next cleanup
+tick deletes everything past the new window. This is not reversible. Set
+`HISTORY_RETENTION_DAYS = "30"` alongside `PLAN = "free"` if you want to keep it;
+the cost is larger scans per dashboard load, so watch your D1 read budget.
+
 ## Quick start
 
 ```bash
