@@ -141,6 +141,39 @@ bun run deploy
 Both `wrangler.toml` and `src/config.ts` are gitignored — your account IDs and
 hostnames stay out of version control.
 
+## Using it from your own project
+
+The quick start deploys *this* repo. If you'd rather keep your configuration in
+your own version-controlled repo — and you should, if you run more than one
+deployment — import the worker instead of forking it.
+
+Vendor this repo however you like (git submodule, `git subtree`, or a path
+dependency), then in your own project:
+
+```ts
+// src/index.ts — your repo, your wrangler.toml, your config in git
+import { createWorker } from '../vendor/uptime-tracker/src/index';
+import { config, ddnsClients } from './config';
+
+export default createWorker({ config, ddnsClients });
+```
+
+Point your `wrangler.toml` at your own entry file (`main = "src/index.ts"`) and
+deploy from your repo. Nothing has to be created or copied *inside* the vendored
+tree — which matters, because a parent git repo cannot track files inside a
+submodule's working tree, and `src/config.ts` here is gitignored.
+
+That works because `src/index.ts` is the library and imports no configuration.
+The only file that reads `./config` is `src/worker.ts`, the standalone entry used
+by the quick start above. Keep it that way if you send patches.
+
+Your config module is ordinary TypeScript, so it is typechecked against
+`DashboardConfig` and reviewable in a diff. Configuration is deliberately *not*
+read from an environment variable: a Workers `[vars]` entry is capped at 5 KB on
+both Free and Paid, a non-trivial config exceeds that, and parsing it would burn
+CPU on every cold start against the Free plan's 10 ms ceiling. Bundled config
+counts against the 3 MB compressed script limit instead.
+
 ## Authentication
 
 **By default the dashboard is public.** It exposes your monitored hostnames and
@@ -207,7 +240,8 @@ which case the panel stays hidden and no DDNS alerting runs.
 
 | File                | Purpose                                                          |
 | ------------------- | ---------------------------------------------------------------- |
-| `index.ts`          | Request + cron handlers, routing, notification logic             |
+| `worker.ts`         | Standalone entry — the only file that imports `config.ts`        |
+| `index.ts`          | The library: `createWorker()`, request + cron handlers, routing  |
 | `plan.ts`           | Free/paid plan profiles — every tunable and why                  |
 | `config.example.ts` | What to monitor (copy to `config.ts`)                            |
 | `types.ts`          | Shared interfaces                                                |

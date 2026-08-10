@@ -1,5 +1,4 @@
 import type { DashboardConfig, GitHubWorkflowConfig, LabelDefinition, PanelStatus, ServiceStatus } from './types';
-import { config } from './config';
 import type { PlanProfile } from './plan';
 import type { ChartData, DdnsLogEntry, UptimeByPeriod } from './storage';
 import { renderCostPanelHtml, COST_PANEL_CSS, type CostPanelData } from './cost/ui';
@@ -403,7 +402,7 @@ export function renderDashboard(
             <span class="panel-count"><span class="up">${upCount}</span>${downCount > 0 ? ` / <span class="down">${downCount}</span>` : ''} services</span>
           </div>
           <div class="services">
-            ${panel.services.map(s => renderService(s, !!vapidPublicKey, uptime, labelMap)).join('')}
+            ${panel.services.map(s => renderService(config, s, !!vapidPublicKey, uptime, labelMap)).join('')}
           </div>
         </div>
       `;
@@ -1803,6 +1802,7 @@ function uptimeClass(val: number | null): string {
 }
 
 function renderService(
+  config: DashboardConfig,
   s: ServiceStatus,
   showBells = false,
   uptime?: Record<string, UptimeByPeriod>,

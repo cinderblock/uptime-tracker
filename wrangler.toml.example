@@ -9,7 +9,11 @@
 #   bun run migrate
 
 name = "uptime"
-main = "src/index.ts"
+# src/worker.ts is the standalone entry: it reads src/config.ts and calls
+# createWorker(). src/index.ts is the library and imports no config, so it can be
+# vendored as a submodule. If you consume this repo from your own project, point
+# `main` at YOUR entry file instead and import createWorker from here.
+main = "src/worker.ts"
 compatibility_date = "2024-01-01"
 upload_source_maps = true
 

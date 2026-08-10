@@ -1,6 +1,7 @@
 import type {
   Env,
   CheckResult,
+  DashboardConfig,
   PanelStatus,
   ServiceStatus,
   PushUrgency,
@@ -10,7 +11,6 @@ import type {
   DdnsClient,
   LaneObservation,
 } from './types';
-import { config, ddnsClients } from './config';
 import {
   assertAuthConfig,
   buildAuthCookie,
@@ -176,7 +176,7 @@ self.addEventListener('notificationclick', (e) => {
 `.trim();
 
 /** In dev mode (localhost), auto-run checks if data is stale or missing */
-async function ensureFreshData(request: Request, env: Env, plan: PlanProfile): Promise<void> {
+async function ensureFreshData(config: DashboardConfig, request: Request, env: Env, plan: PlanProfile): Promise<void> {
   const hostname = new URL(request.url).hostname;
   if (hostname !== 'localhost' && hostname !== '127.0.0.1') return;
 
@@ -272,155 +272,175 @@ function renderLoginPage(error?: string): Response {
   });
 }
 
-export default {
-  /** HTTP request handler */
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
+/** Options for {@link createWorker}. */
+export interface WorkerOptions {
+  /** Panels, services, labels, providers and flags to monitor and render. */
+  config: DashboardConfig;
+  /** Dynamic-DNS clients to watch. Omit for none. */
+  ddnsClients?: DdnsClient[];
+}
 
-    // Pure and cheap (a lookup plus a few env parses) — resolving it per
-    // request keeps the read path from having to guess which storage backend
-    // the cron is writing to.
-    const plan = resolvePlan(env);
+/**
+ * Build a Workers handler bound to `options`.
+ *
+ * This is the library entry point. A consumer owns its own `wrangler.toml` and
+ * config module, imports this, and does `export default createWorker({ config })`.
+ * Nothing has to exist inside *this* package's tree for that to work, which is
+ * precisely what lets it be vendored as a git submodule with no copy-in step —
+ * a parent repo cannot track files inside a submodule's working tree.
+ *
+ * `src/worker.ts` is the standalone equivalent, for deploying this repo directly.
+ */
+export function createWorker({ config, ddnsClients = [] }: WorkerOptions): ExportedHandler<Env> {
+  return {
+    /** HTTP request handler */
+    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+      const url = new URL(request.url);
 
-    // Dev mode: auto-run checks in background if data is stale (non-blocking)
-    ctx.waitUntil(ensureFreshData(request, env, plan));
+      // Pure and cheap (a lookup plus a few env parses) — resolving it per
+      // request keeps the read path from having to guess which storage backend
+      // the cron is writing to.
+      const plan = resolvePlan(env);
 
-    // Fail loudly on a half-configured auth setup rather than serving unprotected.
-    assertAuthConfig(env);
+      // Dev mode: auto-run checks in background if data is stale (non-blocking)
+      ctx.waitUntil(ensureFreshData(config, request, env, plan));
 
-    // Handle login form submission
-    if (url.pathname === '/login' && request.method === 'POST') {
-      if (!isAuthEnabled(env)) {
-        return new Response('Authentication is not configured on this deployment.', { status: 404 });
-      }
+      // Fail loudly on a half-configured auth setup rather than serving unprotected.
+      assertAuthConfig(env);
 
-      const formData = await request.formData();
-      const passphrase = formData.get('passphrase') as string;
-
-      if (!passphrase) {
-        return renderLoginPage('Please enter a passphrase');
-      }
-
-      if (!(await verifyPassword(env, passphrase))) {
-        return renderLoginPage('Invalid passphrase');
-      }
-
-      return new Response(null, {
-        status: 302,
-        headers: {
-          Location: '/',
-          'Set-Cookie': await buildAuthCookie(env, url.protocol === 'https:'),
-        },
-      });
-    }
-
-    // Gate everything except static assets, the health probe, and the login page.
-    // When DASHBOARD_PASSWORD is unset the dashboard is intentionally public.
-    if (isAuthEnabled(env) && !isPublicPath(url.pathname)) {
-      if (!(await verifyToken(env, getAuthCookie(request)))) {
-        return renderLoginPage();
-      }
-    }
-
-    try {
-      switch (url.pathname) {
-        case '/':
-          return handleDashboard(env, plan);
-
-        case '/manifest.json':
-          return new Response(MANIFEST_JSON, {
-            headers: { 'Content-Type': 'application/manifest+json', 'Cache-Control': 'public, max-age=3600' },
-          });
-
-        case '/sw.js':
-          return new Response(SW_JS, {
-            headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache' },
-          });
-
-        case '/icon.svg':
-          return new Response(ICON_SVG, {
-            headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' },
-          });
-
-        case '/icon-180.png':
-          return new Response(ICON_180_PNG, {
-            headers: { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' },
-          });
-
-        case '/icon-192.png':
-          return new Response(ICON_192_PNG, {
-            headers: { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' },
-          });
-
-        case '/icon-512.png':
-          return new Response(ICON_512_PNG, {
-            headers: { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' },
-          });
-
-        case '/api/poll':
-          return handleApiPoll(request, env, plan);
-
-        case '/api/history':
-          if (request.method === 'DELETE') return handleDeleteHistory(request, env);
-          return handleApiHistory(request, env);
-
-        case '/api/probe':
-          // Browser submitting check results
-          return handleApiProbe(request, env, ctx);
-
-        case '/api/usage': {
-          // Cookie-exempt (reporting apps aren't browsers) but token-gated.
-          const denied = await verifyUsageToken(env, request);
-          return denied ?? handleApiUsage(request, env);
+      // Handle login form submission
+      if (url.pathname === '/login' && request.method === 'POST') {
+        if (!isAuthEnabled(env)) {
+          return new Response('Authentication is not configured on this deployment.', { status: 404 });
         }
 
-        case '/api/cost':
-          return handleApiCost(env);
+        const formData = await request.formData();
+        const passphrase = formData.get('passphrase') as string;
 
-        case '/api/errors':
-          return handleApiErrors(url, env);
+        if (!passphrase) {
+          return renderLoginPage('Please enter a passphrase');
+        }
 
-        case '/api/ddns-log':
-          return handleApiDdnsLog(url, env, plan);
+        if (!(await verifyPassword(env, passphrase))) {
+          return renderLoginPage('Invalid passphrase');
+        }
 
-        case '/api/subscribe':
-          return handleApiSubscribe(request, env);
-
-        case '/api/unsubscribe':
-          return handleApiUnsubscribe(request, env);
-
-        case '/api/notification-settings':
-          return handleApiNotificationSettings(request, env);
-
-        case '/api/subscriptions':
-          return handleApiSubscriptions(request, env);
-
-        case '/errors':
-          return handleErrorsPage(url, env);
-
-        case '/ddns':
-          return handleDdnsPage(url, env, plan);
-
-        case '/subscriptions':
-          return handleSubscriptionsPage(env);
-
-        case '/health':
-          return new Response('ok', { status: 200 });
-
-        case '/favicon.ico':
-        case '/robots.txt':
-          return new Response(null, { status: 204 });
-
-        default:
-          return new Response('Not Found', { status: 404 });
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: '/',
+            'Set-Cookie': await buildAuthCookie(env, url.protocol === 'https:'),
+          },
+        });
       }
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      console.error('Request error:', error.message);
-      console.error('Stack:', error.stack);
 
-      // Return detailed error page for debugging (behind auth anyway)
-      const html = `<!DOCTYPE html>
+      // Gate everything except static assets, the health probe, and the login page.
+      // When DASHBOARD_PASSWORD is unset the dashboard is intentionally public.
+      if (isAuthEnabled(env) && !isPublicPath(url.pathname)) {
+        if (!(await verifyToken(env, getAuthCookie(request)))) {
+          return renderLoginPage();
+        }
+      }
+
+      try {
+        switch (url.pathname) {
+          case '/':
+            return handleDashboard(config, env, plan);
+
+          case '/manifest.json':
+            return new Response(MANIFEST_JSON, {
+              headers: { 'Content-Type': 'application/manifest+json', 'Cache-Control': 'public, max-age=3600' },
+            });
+
+          case '/sw.js':
+            return new Response(SW_JS, {
+              headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache' },
+            });
+
+          case '/icon.svg':
+            return new Response(ICON_SVG, {
+              headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' },
+            });
+
+          case '/icon-180.png':
+            return new Response(ICON_180_PNG, {
+              headers: { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' },
+            });
+
+          case '/icon-192.png':
+            return new Response(ICON_192_PNG, {
+              headers: { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' },
+            });
+
+          case '/icon-512.png':
+            return new Response(ICON_512_PNG, {
+              headers: { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' },
+            });
+
+          case '/api/poll':
+            return handleApiPoll(config, request, env, plan);
+
+          case '/api/history':
+            if (request.method === 'DELETE') return handleDeleteHistory(request, env);
+            return handleApiHistory(request, env);
+
+          case '/api/probe':
+            // Browser submitting check results
+            return handleApiProbe(request, env, ctx);
+
+          case '/api/usage': {
+            // Cookie-exempt (reporting apps aren't browsers) but token-gated.
+            const denied = await verifyUsageToken(env, request);
+            return denied ?? handleApiUsage(request, env);
+          }
+
+          case '/api/cost':
+            return handleApiCost(env);
+
+          case '/api/errors':
+            return handleApiErrors(url, env);
+
+          case '/api/ddns-log':
+            return handleApiDdnsLog(url, env, plan);
+
+          case '/api/subscribe':
+            return handleApiSubscribe(request, env);
+
+          case '/api/unsubscribe':
+            return handleApiUnsubscribe(request, env);
+
+          case '/api/notification-settings':
+            return handleApiNotificationSettings(request, env);
+
+          case '/api/subscriptions':
+            return handleApiSubscriptions(request, env);
+
+          case '/errors':
+            return handleErrorsPage(url, env);
+
+          case '/ddns':
+            return handleDdnsPage(url, env, plan);
+
+          case '/subscriptions':
+            return handleSubscriptionsPage(env);
+
+          case '/health':
+            return new Response('ok', { status: 200 });
+
+          case '/favicon.ico':
+          case '/robots.txt':
+            return new Response(null, { status: 204 });
+
+          default:
+            return new Response('Not Found', { status: 404 });
+        }
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        console.error('Request error:', error.message);
+        console.error('Stack:', error.stack);
+
+        // Return detailed error page for debugging (behind auth anyway)
+        const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -449,165 +469,175 @@ export default {
 </body>
 </html>`;
 
-      return new Response(html, {
-        status: 500,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
-      });
-    }
-  },
-
-  /** Scheduled cron handler */
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    try {
-      const plan = resolvePlan(env);
-      console.log(`Running scheduled checks (plan: ${plan.tier})...`);
-
-      // Load last-checked times, notification settings, and prior status in parallel.
-      // `cached` doubles as (1) input to the retry-on-timeout map (so a glitch
-      // after a prior 'up' triggers one retry) and (2) the merge baseline for
-      // services we don't have budget to recheck this tick.
-      const [lastCheckedTimes, allNotifSettings, cached] = await Promise.all([
-        getLastCheckedTimes(plan, env.KV, env.DB),
-        getAllNotificationSettings(env.DB),
-        getCurrentStatus(plan, env.KV, env.DB),
-      ]);
-
-      // Services with notifications enabled get checked first
-      const priorityKeys = new Set(
-        Object.entries(allNotifSettings)
-          .filter(([, s]) => s.enabled)
-          .map(([key]) => key),
-      );
-
-      // URL → most recent CheckResult, threaded through runBudgetedChecks so
-      // runHttpCheck/runWwwCheck can decide whether a timeout warrants a retry.
-      const previousResults = new Map<string, CheckResult>();
-      for (const panel of cached?.panels ?? []) {
-        for (const service of panel.services) {
-          for (const check of service.checks) previousResults.set(check.url, check);
-          if (service.wwwCheck) previousResults.set(service.wwwCheck.url, service.wwwCheck);
-        }
+        return new Response(html, {
+          status: 500,
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
       }
+    },
 
-      // Run budget-aware checks (priority services first, then by staleness)
-      const concurrency = parseConcurrency(env.CHECK_CONCURRENCY ?? plan.checkConcurrency);
-      const freshResults = await runBudgetedChecks(
-        config,
-        lastCheckedTimes,
-        'edge',
-        priorityKeys,
-        concurrency,
-        previousResults,
-        plan.checkBudget,
-      );
+    /** Scheduled cron handler.
+     *
+     *  The first argument is a `ScheduledController` (`scheduledTime`, `cron`,
+     *  `noRetry()`), NOT a `ScheduledEvent` — it was annotated as the latter
+     *  until `createWorker` gave the handler an `ExportedHandler<Env>` to be
+     *  checked against. Only `scheduledTime` is read, which both types carry,
+     *  so this was a wrong annotation rather than a runtime fault. Note a
+     *  controller has no `waitUntil` — use `ctx.waitUntil`. */
+    async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+      try {
+        const plan = resolvePlan(env);
+        console.log(`Running scheduled checks (plan: ${plan.tier})...`);
 
-      // Merge fresh results with cached status (unchecked services keep previous state)
-      const panels = buildMergedStatus(freshResults, cached);
+        // Load last-checked times, notification settings, and prior status in parallel.
+        // `cached` doubles as (1) input to the retry-on-timeout map (so a glitch
+        // after a prior 'up' triggers one retry) and (2) the merge baseline for
+        // services we don't have budget to recheck this tick.
+        const [lastCheckedTimes, allNotifSettings, cached] = await Promise.all([
+          getLastCheckedTimes(plan, env.KV, env.DB),
+          getAllNotificationSettings(env.DB),
+          getCurrentStatus(plan, env.KV, env.DB),
+        ]);
 
-      // Save only fresh check results to history
-      const allResults: CheckResult[] = [];
-      for (const { checks, wwwCheck } of freshResults.values()) {
-        allResults.push(...checks);
-        if (wwwCheck) allResults.push(wwwCheck);
-      }
-      await addToHistory(env.DB, allResults);
-      console.log(`Saved ${allResults.length} check results to history`);
+        // Services with notifications enabled get checked first
+        const priorityKeys = new Set(
+          Object.entries(allNotifSettings)
+            .filter(([, s]) => s.enabled)
+            .map(([key]) => key),
+        );
 
-      // Paid: incrementally update the durable chart + uptime KV state so the
-      // read path stays D1-free. Worst-of-bucket merge for chart, sum counters
-      // for uptime; both run in a few ms and replace the prior hourly D1 scans.
-      // First call after deploy self-backfills from D1 (one-time ~$0.01).
-      //
-      // Free: those two are no-ops (the blobs are far too large to touch under
-      // a 10 ms CPU limit) and `rollUpHourly` maintains the D1 `uptime_hourly`
-      // table instead — one UPSERT per service per hour, read back on demand.
-      await Promise.all([
-        updateChartTiered(plan, env.KV, env.DB, allResults),
-        updateUptimeBuckets(plan, env.KV, env.DB, allResults),
-        plan.aggregateStore === 'd1' ? rollUpHourly(env.DB, allResults, plan.historyRetentionDays) : Promise.resolve(),
-      ]);
-
-      // Update last-checked times with fresh results, then save status + times to KV (single write)
-      for (const r of allResults) {
-        const existing = lastCheckedTimes.get(r.service);
-        if (!existing || r.timestamp > existing) {
-          lastCheckedTimes.set(r.service, r.timestamp);
-        }
-      }
-      await saveCurrentStatus(plan, env.KV, env.DB, panels, lastCheckedTimes);
-
-      const scheduled = new Date(event.scheduledTime);
-      const minuteOfDay = scheduled.getUTCHours() * 60 + scheduled.getUTCMinutes();
-
-      // DDNS log is small (LIMIT 200 + indexed). The cache TTL is derived from
-      // the cron interval — if it lapses, every dashboard request falls back to
-      // a 200-row D1 query.
-      ctx.waitUntil(refreshDdnsCache(plan, env.KV, env.DB, ddnsCacheTtlSeconds(plan)));
-
-      // Detect services that newly transitioned to 'down' and send push notifications
-      ctx.waitUntil(sendDowntimeNotifications(panels, env));
-
-      // Detect DDNS staleness (heartbeat clients) and send push notifications
-      ctx.waitUntil(sendDdnsFailureNotifications(env));
-
-      // Notify on actual DDNS IP changes (any client)
-      ctx.waitUntil(sendDdnsIpChangeNotifications(env));
-
-      // Detect GitHub build failures and send push notifications
-      ctx.waitUntil(sendBuildFailureNotifications(env));
-
-      // Record state flips for the correlation timeline (services + GitHub + DDNS).
-      // Wrapped so a GitHub API hiccup can't fail the scheduled handler.
-      ctx.waitUntil(
-        recordTransitions(env, plan, panels, Date.now()).catch(err =>
-          console.error('recordTransitions failed:', err instanceof Error ? err.message : err),
-        ),
-      );
-
-      // Cost monitor: poll CF GraphQL Analytics for the previous full hour at
-      // :01 each hour (waits one minute past the hourly boundary so CF's
-      // analytics ingestion has settled). Wrapped to never throw into the
-      // outer scheduled handler — a cost-tracking failure must NOT take down
-      // uptime monitoring.
-      if (isNthTick(minuteOfDay, plan, plan.costPollEveryTicks)) {
-        ctx.waitUntil(pollCloudflareUsageSafely(env));
-      }
-
-      // Threshold checks cost 2 KV reads + 5 D1 SUMs. Cheap on paid (every
-      // tick); rate-limited on free, where those reads are metered.
-      if (isNthTick(minuteOfDay, plan, plan.costCheckEveryTicks)) {
-        ctx.waitUntil(checkAndFireThresholdAlerts(env));
-      }
-
-      // Clean up old entries periodically. Deletes count as D1 rows written,
-      // so the cadence is part of the plan budget.
-      if (isNthTick(minuteOfDay, plan, plan.cleanupEveryTicks)) {
-        const deleted = await cleanupHistory(env.DB, plan.historyRetentionDays);
-        if (deleted > 0) console.log(`Cleaned up ${deleted} old history entries`);
-
-        // Free only: the hourly rollup ages out on the same window as `checks`.
-        if (plan.aggregateStore === 'd1') {
-          const rollupDeleted = await cleanupRollup(env.DB, plan.historyRetentionDays);
-          if (rollupDeleted > 0) console.log(`Cleaned up ${rollupDeleted} old hourly rollup rows`);
+        // URL → most recent CheckResult, threaded through runBudgetedChecks so
+        // runHttpCheck/runWwwCheck can decide whether a timeout warrants a retry.
+        const previousResults = new Map<string, CheckResult>();
+        for (const panel of cached?.panels ?? []) {
+          for (const service of panel.services) {
+            for (const check of service.checks) previousResults.set(check.url, check);
+            if (service.wwwCheck) previousResults.set(service.wwwCheck.url, service.wwwCheck);
+          }
         }
 
-        const ddnsDeleted = await cleanupDdnsLog(env.DB);
-        if (ddnsDeleted > 0) console.log(`Cleaned up ${ddnsDeleted} old DDNS log entries`);
+        // Run budget-aware checks (priority services first, then by staleness)
+        const concurrency = parseConcurrency(env.CHECK_CONCURRENCY ?? plan.checkConcurrency);
+        const freshResults = await runBudgetedChecks(
+          config,
+          lastCheckedTimes,
+          'edge',
+          priorityKeys,
+          concurrency,
+          previousResults,
+          plan.checkBudget,
+        );
 
-        const notifLogDeleted = await cleanupNotificationLog(env.DB);
-        if (notifLogDeleted > 0) console.log(`Cleaned up ${notifLogDeleted} old notification log entries`);
+        // Merge fresh results with cached status (unchecked services keep previous state)
+        const panels = buildMergedStatus(config, freshResults, cached);
 
-        const usageDeleted = await cleanupUsageLog(env.DB);
-        if (usageDeleted > 0) console.log(`Cleaned up ${usageDeleted} old usage_log entries`);
+        // Save only fresh check results to history
+        const allResults: CheckResult[] = [];
+        for (const { checks, wwwCheck } of freshResults.values()) {
+          allResults.push(...checks);
+          if (wwwCheck) allResults.push(wwwCheck);
+        }
+        await addToHistory(env.DB, allResults);
+        console.log(`Saved ${allResults.length} check results to history`);
+
+        // Paid: incrementally update the durable chart + uptime KV state so the
+        // read path stays D1-free. Worst-of-bucket merge for chart, sum counters
+        // for uptime; both run in a few ms and replace the prior hourly D1 scans.
+        // First call after deploy self-backfills from D1 (one-time ~$0.01).
+        //
+        // Free: those two are no-ops (the blobs are far too large to touch under
+        // a 10 ms CPU limit) and `rollUpHourly` maintains the D1 `uptime_hourly`
+        // table instead — one UPSERT per service per hour, read back on demand.
+        await Promise.all([
+          updateChartTiered(plan, env.KV, env.DB, allResults),
+          updateUptimeBuckets(plan, env.KV, env.DB, allResults),
+          plan.aggregateStore === 'd1'
+            ? rollUpHourly(env.DB, allResults, plan.historyRetentionDays)
+            : Promise.resolve(),
+        ]);
+
+        // Update last-checked times with fresh results, then save status + times to KV (single write)
+        for (const r of allResults) {
+          const existing = lastCheckedTimes.get(r.service);
+          if (!existing || r.timestamp > existing) {
+            lastCheckedTimes.set(r.service, r.timestamp);
+          }
+        }
+        await saveCurrentStatus(plan, env.KV, env.DB, panels, lastCheckedTimes);
+
+        const scheduled = new Date(controller.scheduledTime);
+        const minuteOfDay = scheduled.getUTCHours() * 60 + scheduled.getUTCMinutes();
+
+        // DDNS log is small (LIMIT 200 + indexed). The cache TTL is derived from
+        // the cron interval — if it lapses, every dashboard request falls back to
+        // a 200-row D1 query.
+        ctx.waitUntil(refreshDdnsCache(plan, env.KV, env.DB, ddnsCacheTtlSeconds(plan)));
+
+        // Detect services that newly transitioned to 'down' and send push notifications
+        ctx.waitUntil(sendDowntimeNotifications(panels, env));
+
+        // Detect DDNS staleness (heartbeat clients) and send push notifications
+        ctx.waitUntil(sendDdnsFailureNotifications(ddnsClients, env));
+
+        // Notify on actual DDNS IP changes (any client)
+        ctx.waitUntil(sendDdnsIpChangeNotifications(env));
+
+        // Detect GitHub build failures and send push notifications
+        ctx.waitUntil(sendBuildFailureNotifications(config, env));
+
+        // Record state flips for the correlation timeline (services + GitHub + DDNS).
+        // Wrapped so a GitHub API hiccup can't fail the scheduled handler.
+        ctx.waitUntil(
+          recordTransitions(config, ddnsClients, env, plan, panels, Date.now()).catch(err =>
+            console.error('recordTransitions failed:', err instanceof Error ? err.message : err),
+          ),
+        );
+
+        // Cost monitor: poll CF GraphQL Analytics for the previous full hour at
+        // :01 each hour (waits one minute past the hourly boundary so CF's
+        // analytics ingestion has settled). Wrapped to never throw into the
+        // outer scheduled handler — a cost-tracking failure must NOT take down
+        // uptime monitoring.
+        if (isNthTick(minuteOfDay, plan, plan.costPollEveryTicks)) {
+          ctx.waitUntil(pollCloudflareUsageSafely(env));
+        }
+
+        // Threshold checks cost 2 KV reads + 5 D1 SUMs. Cheap on paid (every
+        // tick); rate-limited on free, where those reads are metered.
+        if (isNthTick(minuteOfDay, plan, plan.costCheckEveryTicks)) {
+          ctx.waitUntil(checkAndFireThresholdAlerts(env));
+        }
+
+        // Clean up old entries periodically. Deletes count as D1 rows written,
+        // so the cadence is part of the plan budget.
+        if (isNthTick(minuteOfDay, plan, plan.cleanupEveryTicks)) {
+          const deleted = await cleanupHistory(env.DB, plan.historyRetentionDays);
+          if (deleted > 0) console.log(`Cleaned up ${deleted} old history entries`);
+
+          // Free only: the hourly rollup ages out on the same window as `checks`.
+          if (plan.aggregateStore === 'd1') {
+            const rollupDeleted = await cleanupRollup(env.DB, plan.historyRetentionDays);
+            if (rollupDeleted > 0) console.log(`Cleaned up ${rollupDeleted} old hourly rollup rows`);
+          }
+
+          const ddnsDeleted = await cleanupDdnsLog(env.DB);
+          if (ddnsDeleted > 0) console.log(`Cleaned up ${ddnsDeleted} old DDNS log entries`);
+
+          const notifLogDeleted = await cleanupNotificationLog(env.DB);
+          if (notifLogDeleted > 0) console.log(`Cleaned up ${notifLogDeleted} old notification log entries`);
+
+          const usageDeleted = await cleanupUsageLog(env.DB);
+          if (usageDeleted > 0) console.log(`Cleaned up ${usageDeleted} old usage_log entries`);
+        }
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        console.error('Scheduled task error:', error.message);
+        console.error('Stack:', error.stack);
+        throw error; // Re-throw so Cloudflare logs it
       }
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      console.error('Scheduled task error:', error.message);
-      console.error('Stack:', error.stack);
-      throw error; // Re-throw so Cloudflare logs it
-    }
-  },
-};
+    },
+  };
+}
 
 /** Send push notifications to all subscribers, removing expired ones.
  *  Returns delivery result with subscriber count and whether any were delivered. */
@@ -841,7 +871,7 @@ const DDNS_STALE_MS = 60 * 60 * 1000;
  *  no_change/ip_change per hostname. User-facing settings are shared under the
  *  'ddns' key; runtime down/recovery state is tracked per hostname under
  *  `ddns:<hostname>`. */
-async function sendDdnsFailureNotifications(env: Env): Promise<void> {
+async function sendDdnsFailureNotifications(ddnsClients: DdnsClient[], env: Env): Promise<void> {
   const vapid = getVapid(env);
   if (!vapid) return;
 
@@ -1029,7 +1059,7 @@ async function fetchGitHubWorkflowStatus(
  *  Only polls workflows that have notifications enabled.
  *  Uses run ID in notification_state.consecutive_down to avoid re-notifying
  *  for the same run across scheduler cycles. */
-async function sendBuildFailureNotifications(env: Env): Promise<void> {
+async function sendBuildFailureNotifications(config: DashboardConfig, env: Env): Promise<void> {
   const vapid = getVapid(env);
   if (!vapid) return;
 
@@ -1124,7 +1154,14 @@ async function sendBuildFailureNotifications(env: Env): Promise<void> {
  *  5-min in-memory cache, so re-reading every tick costs at most one API call
  *  per workflow per 5 minutes. Independent of notification settings — the
  *  timeline tracks all configured entities. */
-async function recordTransitions(env: Env, plan: PlanProfile, panels: PanelStatus[], now: number): Promise<void> {
+async function recordTransitions(
+  config: DashboardConfig,
+  ddnsClients: DdnsClient[],
+  env: Env,
+  plan: PlanProfile,
+  panels: PanelStatus[],
+  now: number,
+): Promise<void> {
   const observations: LaneObservation[] = [];
 
   // Services — skip internal-only services (the edge can't reach them).
@@ -1185,6 +1222,7 @@ async function recordTransitions(env: Env, plan: PlanProfile, panels: PanelStatu
 /** Merge fresh check results with cached status, using config as source of truth for structure.
  * Fresh results override cached; unchecked services retain their previous state. */
 function buildMergedStatus(
+  config: DashboardConfig,
   freshResults: Map<string, { checks: CheckResult[]; wwwCheck?: CheckResult }>,
   cached: { panels: PanelStatus[]; lastUpdate: number } | null,
 ): PanelStatus[] {
@@ -1225,7 +1263,10 @@ function buildMergedStatus(
 }
 
 /** Merge config metadata with cached check results (config = source of truth for metadata) */
-function mergeConfigWithStatus(cached: { panels: PanelStatus[]; lastUpdate: number } | null): {
+function mergeConfigWithStatus(
+  config: DashboardConfig,
+  cached: { panels: PanelStatus[]; lastUpdate: number } | null,
+): {
   panels: PanelStatus[];
   lastUpdate: number | null;
 } {
@@ -1267,7 +1308,7 @@ function mergeConfigWithStatus(cached: { panels: PanelStatus[]; lastUpdate: numb
 /** Render the main dashboard page.
  *  Uses streaming: HTML with status + uptime renders immediately,
  *  chart data is appended at the end when the slower query finishes. */
-async function handleDashboard(env: Env, plan: PlanProfile): Promise<Response> {
+async function handleDashboard(config: DashboardConfig, env: Env, plan: PlanProfile): Promise<Response> {
   // Start all queries in parallel — chart query is slow, don't block HTML on it
   const chartsPromise = getChartData(plan, env.KV, env.DB);
   const transitionsPromise = getTransitions(plan, env.KV, env.DB);
@@ -1277,7 +1318,7 @@ async function handleDashboard(env: Env, plan: PlanProfile): Promise<Response> {
     getMultiPeriodUptime(plan, env.KV, env.DB),
     fetchCostPanelData(env),
   ]);
-  const merged = mergeConfigWithStatus(cached);
+  const merged = mergeConfigWithStatus(config, cached);
 
   const html = renderDashboard(plan, config, merged, ddnsLog, env.VAPID_PUBLIC_KEY, uptime, undefined, costData);
 
@@ -1323,7 +1364,12 @@ async function handleDashboard(env: Env, plan: PlanProfile): Promise<Response> {
 /** API: Combined poll endpoint (status + uptime + charts + ddns log in one call)
  *  Supports ?full=true for complete data (uptime + charts), otherwise lightweight (status + ddns only).
  *  Since initial page load inlines chart/uptime data, 30s polls only need status + ddns. */
-async function handleApiPoll(request: Request, env: Env, plan: PlanProfile): Promise<Response> {
+async function handleApiPoll(
+  config: DashboardConfig,
+  request: Request,
+  env: Env,
+  plan: PlanProfile,
+): Promise<Response> {
   const url = new URL(request.url);
   const full = url.searchParams.has('full');
 
@@ -1335,7 +1381,7 @@ async function handleApiPoll(request: Request, env: Env, plan: PlanProfile): Pro
       getRecentDdnsLog(plan, env.KV, env.DB, undefined, 50),
       getTransitions(plan, env.KV, env.DB),
     ]);
-    const status = mergeConfigWithStatus(cached);
+    const status = mergeConfigWithStatus(config, cached);
     return jsonResponse({ ...status, uptime, charts, ddnsLog, transitions });
   }
 
@@ -1344,7 +1390,7 @@ async function handleApiPoll(request: Request, env: Env, plan: PlanProfile): Pro
     getCurrentStatus(plan, env.KV, env.DB),
     getRecentDdnsLog(plan, env.KV, env.DB, undefined, 50),
   ]);
-  const status = mergeConfigWithStatus(cached);
+  const status = mergeConfigWithStatus(config, cached);
   return jsonResponse({ ...status, ddnsLog });
 }
 
