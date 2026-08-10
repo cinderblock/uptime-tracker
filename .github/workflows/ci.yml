@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # --frozen-lockfile so a drifted bun.lock fails here rather than
+      # silently resolving to different versions than a contributor tested.
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      # src/config.ts is gitignored, but src/index.ts and src/ui.ts import it
+      # unconditionally. Both typecheck and test seed it from the example via
+      # their `pre` scripts, which is also what proves the fresh-clone path
+      # still works — the one thing that cannot be verified on a dev machine
+      # that already has a real config.ts.
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test
+
+      - name: Format
+        run: bun run format:check

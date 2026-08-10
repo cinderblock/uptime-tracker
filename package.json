@@ -12,6 +12,7 @@
     "migrate:local": "wrangler d1 migrations apply UPTIME_DB --local",
     "pretest": "bun scripts/ensure-config.ts",
     "test": "bun test",
+    "pretypecheck": "bun scripts/ensure-config.ts",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
