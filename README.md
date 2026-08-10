@@ -143,7 +143,7 @@ hostnames stay out of version control.
 
 ## Using it from your own project
 
-The quick start deploys *this* repo. If you'd rather keep your configuration in
+The quick start deploys _this_ repo. If you'd rather keep your configuration in
 your own version-controlled repo — and you should, if you run more than one
 deployment — import the worker instead of forking it.
 
@@ -159,7 +159,7 @@ export default createWorker({ config, ddnsClients });
 ```
 
 Point your `wrangler.toml` at your own entry file (`main = "src/index.ts"`) and
-deploy from your repo. Nothing has to be created or copied *inside* the vendored
+deploy from your repo. Nothing has to be created or copied _inside_ the vendored
 tree — which matters, because a parent git repo cannot track files inside a
 submodule's working tree, and `src/config.ts` here is gitignored.
 
@@ -168,7 +168,7 @@ The only file that reads `./config` is `src/worker.ts`, the standalone entry use
 by the quick start above. Keep it that way if you send patches.
 
 Your config module is ordinary TypeScript, so it is typechecked against
-`DashboardConfig` and reviewable in a diff. Configuration is deliberately *not*
+`DashboardConfig` and reviewable in a diff. Configuration is deliberately _not_
 read from an environment variable: a Workers `[vars]` entry is capped at 5 KB on
 both Free and Paid, a non-trivial config exceeds that, and parsing it would burn
 CPU on every cold start against the Free plan's 10 ms ceiling. Bundled config
