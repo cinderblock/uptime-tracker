@@ -1,5 +1,5 @@
 import type { DashboardConfig, GitHubWorkflowConfig, LabelDefinition, PanelStatus, ServiceStatus } from './types';
-import type { PlanProfile } from './plan';
+import { chartIntervals, type PlanProfile } from './plan';
 import type { ChartData, DdnsLogEntry, UptimeByPeriod } from './storage';
 import { renderCostPanelHtml, COST_PANEL_CSS, type CostPanelData } from './cost/ui';
 
@@ -681,13 +681,15 @@ export function renderDashboard(
         const colorSegments = [];
         let curSeg = null;
 
-        // Expected data interval varies by age tier (matches server-side decimation buckets)
+        // Expected data interval by age tier, derived from this deployment's
+        // actual cron cadence and storage tier rather than assumed. A gap is
+        // declared at 3x this and ends the line segment, so a hardcoded 1-minute
+        // assumption breaks the line on every cron slower than 3 minutes.
+        const CHART_INTERVALS = ${JSON.stringify(chartIntervals(plan))};
         const expectedInterval = (ts) => {
           const age = globalMaxTime - ts;
-          if (age < 6 * 3600000) return 60000;       // 1 min
-          if (age < 2 * 86400000) return 600000;     // 10 min
-          if (age < 7 * 86400000) return 1800000;    // 30 min
-          return 7200000;                             // 2 hours
+          for (const tier of CHART_INTERVALS.tiers) if (age < tier[0]) return tier[1];
+          return CHART_INTERVALS.fallback;
         };
 
         sampled.forEach((p, i) => {

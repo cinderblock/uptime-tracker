@@ -146,3 +146,39 @@ export function isNthTick(minuteOfDay: number, plan: PlanProfile, everyTicks: nu
   const tickIndex = Math.floor(minuteOfDay / plan.cronIntervalMinutes);
   return tickIndex % everyTicks === 0;
 }
+
+/**
+ * Expected spacing between adjacent chart points, by age, in milliseconds.
+ *
+ * The dashboard treats two points more than 3× this far apart as a gap, which
+ * ends the current line segment. That makes the value load-bearing rather than
+ * cosmetic: a segment holding a single point produces an SVG path of just
+ * `M x y` with no `L`, which renders as nothing. Hardcoding one minute here
+ * therefore erases the line entirely on any cron slower than three minutes,
+ * while leaving the hover dots intact — the chart looks like it lost its line
+ * for no reason.
+ *
+ * `tiers` is ordered by increasing age as `[maxAge, interval]`; `fallback`
+ * applies beyond the last tier.
+ */
+export function chartIntervals(plan: PlanProfile): { tiers: [number, number][]; fallback: number } {
+  const cronMs = plan.cronIntervalMinutes * 60_000;
+  const SIX_HOURS = 6 * 3_600_000;
+
+  // Free retains only the last 6 h as raw checks; anything older is read back
+  // from the uptime_hourly rollup, so it is hourly by construction.
+  if (plan.tier === 'free') {
+    return { tiers: [[SIX_HOURS, cronMs]], fallback: 3_600_000 };
+  }
+
+  // Paid mirrors the server-side decimation buckets (1/10/30/120 min), except
+  // the finest tier follows the configured cron rather than assuming 1 minute.
+  return {
+    tiers: [
+      [SIX_HOURS, cronMs],
+      [2 * 86_400_000, 600_000],
+      [7 * 86_400_000, 1_800_000],
+    ],
+    fallback: 7_200_000,
+  };
+}
