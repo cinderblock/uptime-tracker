@@ -220,6 +220,31 @@ Which paths are public is an **allowlist** in `src/auth.ts`. A new endpoint
 stays admin-only until it's added there on purpose. Without a password, public
 mode has no admin at all: admin paths return 404 rather than falling open.
 
+### Traffic and cost
+
+A public page means anyone can make the Worker do work. Cloudflare's daily
+limits are shared by **everything on the account**. On Workers Free, a client
+looping on the page can't cost money. It can use up those limits, though, and
+then the monitor's own cron writes fail (along with every other Worker on the
+account) until 00:00 UTC. On Workers Paid there's no spending cap, so usage
+charges just keep growing. Two things keep that in check:
+
+- **Reads are reused until the next tick.** Chart and uptime data only change
+  when the cron runs, so a warm isolate keeps them in memory, keyed on the status
+  blob's `lastUpdate` (`src/read-memo.ts`). A repeat page view then costs one
+  single-row status read instead of a rollup scan (about 1.5–2k D1 rows for three
+  services on free).
+- **Per-IP rate limiting** for everyone except a logged-in admin. Add a
+  `[[ratelimits]]` binding named `RATE_LIMITER` (see `wrangler.toml.example`).
+  Static assets, `/health` and `/api/usage` aren't counted. Unset, nothing is
+  limited. If the binding errors, the request is let through rather than
+  locking everyone out. Cloudflare counts per location and approximately, so
+  treat the limit as a ceiling for runaway clients, not an exact quota.
+
+With a custom domain, a zone rate-limiting rule (the Free plan includes one) can
+also stop a flood before the Worker runs at all. Then set `workers_dev = false`,
+so the `workers.dev` address can't be used to get around it.
+
 ## Push notifications (optional)
 
 ```bash
@@ -288,10 +313,11 @@ which case the panel stays hidden and no DDNS alerting runs.
 
 ## Bindings
 
-| Type | Binding | Purpose                                                                          |
-| ---- | ------- | -------------------------------------------------------------------------------- |
-| D1   | `DB`    | Check results, DDNS log, push subscriptions, notification history                |
-| KV   | `KV`    | Hot-path dashboard status; on paid, also the precomputed chart/uptime aggregates |
+| Type                  | Binding        | Purpose                                                                          |
+| --------------------- | -------------- | -------------------------------------------------------------------------------- |
+| D1                    | `DB`           | Check results, DDNS log, push subscriptions, notification history                |
+| KV                    | `KV`           | Hot-path dashboard status; on paid, also the precomputed chart/uptime aggregates |
+| Rate limit (optional) | `RATE_LIMITER` | Per-IP request limit for non-admins (see "Traffic and cost")                     |
 
 ## Source layout
 
@@ -306,6 +332,8 @@ which case the panel stays hidden and no DDNS alerting runs.
 | `storage.ts`        | D1 + KV access, history, uptime math                             |
 | `ui.ts`             | Dashboard HTML                                                   |
 | `auth.ts`           | Signed-cookie session auth                                       |
+| `rate-limit.ts`     | Per-IP request limiting for non-admins                           |
+| `read-memo.ts`      | Reuses chart/uptime reads until the next tick                    |
 | `push.ts`           | Web Push (RFC 8291 encryption + RFC 8292 VAPID), no dependencies |
 | `icons.ts`          | PWA icons                                                        |
 | `cost/`             | Cloudflare usage polling, pricing, thresholds                    |

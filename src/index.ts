@@ -32,6 +32,8 @@ import {
 } from './auth';
 import { runAllChecks, runBudgetedChecks, parseConcurrency } from './checks';
 import { ddnsCacheTtlSeconds, isNthTick, resolvePlan, type PlanProfile } from './plan';
+import { rateLimitResponse } from './rate-limit';
+import { createGenerationMemo, type GenerationMemo } from './read-memo';
 import {
   saveCurrentStatus,
   getCurrentStatus,
@@ -312,6 +314,7 @@ export interface WorkerOptions {
  * `src/worker.ts` is the standalone equivalent, for deploying this repo directly.
  */
 export function createWorker({ config, ddnsClients = [] }: WorkerOptions): ExportedHandler<Env> {
+  const memo = createGenerationMemo();
   return {
     /** HTTP request handler */
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -327,6 +330,13 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
 
       // Fail loudly on a half-configured auth setup rather than serving unprotected.
       assertAuthConfig(env);
+
+      // Per-IP limit for everyone but a logged-in admin, login attempts included.
+      const admin = await isAdminRequest(env, request);
+      if (!admin) {
+        const limited = await rateLimitResponse(env, request, url.pathname);
+        if (limited) return limited;
+      }
 
       // Handle login form submission
       if (url.pathname === '/login' && request.method === 'POST') {
@@ -374,7 +384,6 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
       // Gate everything except static assets, the health probe, and the login
       // page — and, in public mode, the read-only status view. With neither a
       // password nor public mode, everyone is admin (the original open mode).
-      const admin = await isAdminRequest(env, request);
       const publicMode = isPublicMode(env);
       if (url.pathname === '/login') {
         // An explicit visit to the login page (the public view's Admin link).
@@ -395,7 +404,7 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
       try {
         switch (url.pathname) {
           case '/':
-            return handleDashboard(config, env, plan, access);
+            return handleDashboard(config, env, plan, access, memo);
 
           case '/manifest.json':
             return new Response(MANIFEST_JSON, {
@@ -428,7 +437,7 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
             });
 
           case '/api/poll':
-            return handleApiPoll(config, request, env, plan, admin);
+            return handleApiPoll(config, request, env, plan, admin, memo);
 
           case '/api/history':
             if (request.method === 'DELETE') return handleDeleteHistory(request, env);
@@ -1384,16 +1393,21 @@ async function handleDashboard(
   env: Env,
   plan: PlanProfile,
   access: DashboardAccess,
+  memo: GenerationMemo,
 ): Promise<Response> {
   const { admin } = access;
-  // Start all queries in parallel — chart query is slow, don't block HTML on it
-  const chartsPromise = getChartData(plan, env.KV, env.DB);
+  // The status blob is one row and its lastUpdate keys the memo, so read it
+  // first. Charts and uptime come from memory until the next tick.
+  const statusPromise = getCurrentStatus(plan, env.KV, env.DB);
+  const generation = statusPromise.then(s => s?.lastUpdate);
+  // Start the rest in parallel — the chart query is slow, don't block HTML on it.
+  const chartsPromise = generation.then(g => memo('charts', g, () => getChartData(plan, env.KV, env.DB)));
   const transitionsPromise = getTransitions(plan, env.KV, env.DB).then(t => visibleTransitions(t, admin));
   // DDNS (home IPs) and cost data are admin-only, so don't even query them otherwise.
   const [cached, ddnsLog, uptime, costData] = await Promise.all([
-    getCurrentStatus(plan, env.KV, env.DB),
+    statusPromise,
     admin ? getRecentDdnsLog(plan, env.KV, env.DB, undefined, 50) : [],
-    getMultiPeriodUptime(plan, env.KV, env.DB),
+    generation.then(g => memo('uptime', g, () => getMultiPeriodUptime(plan, env.KV, env.DB))),
     admin ? fetchCostPanelData(env) : undefined,
   ]);
   const merged = mergeConfigWithStatus(config, cached);
@@ -1458,15 +1472,18 @@ async function handleApiPoll(
   env: Env,
   plan: PlanProfile,
   admin: boolean,
+  memo: GenerationMemo,
 ): Promise<Response> {
   const url = new URL(request.url);
   const full = url.searchParams.has('full');
 
   if (full) {
+    const statusPromise = getCurrentStatus(plan, env.KV, env.DB);
+    const generation = statusPromise.then(s => s?.lastUpdate);
     const [cached, uptime, charts, ddnsLog, transitions] = await Promise.all([
-      getCurrentStatus(plan, env.KV, env.DB),
-      getMultiPeriodUptime(plan, env.KV, env.DB),
-      getChartData(plan, env.KV, env.DB),
+      statusPromise,
+      generation.then(g => memo('uptime', g, () => getMultiPeriodUptime(plan, env.KV, env.DB))),
+      generation.then(g => memo('charts', g, () => getChartData(plan, env.KV, env.DB))),
       admin ? getRecentDdnsLog(plan, env.KV, env.DB, undefined, 50) : [],
       getTransitions(plan, env.KV, env.DB),
     ]);

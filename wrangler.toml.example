@@ -79,6 +79,15 @@ CF_ACCOUNT_ID = ""
 # Most push subscriptions accepted from non-admins (default 100).
 # MAX_SUBSCRIPTIONS = "100"
 
+# ── Rate limiting (optional, recommended with PUBLIC_DASHBOARD) ─────────────
+# Per-IP limit for everyone but a logged-in admin. An open tab polls about twice a
+# minute, and a meeting room behind one NAT shares an IP, so leave headroom.
+# namespace_id is any positive integer unique among your account's rate limiters.
+# [[ratelimits]]
+# name = "RATE_LIMITER"
+# namespace_id = "1001"
+# simple = { limit = 120, period = 60 } # period must be 10 or 60
+
 # ── Secrets (never put these here — use `wrangler secret put <NAME>`) ────────
 # DASHBOARD_PASSWORD  Passphrase gating the dashboard. UNSET = FULLY OPEN, admin included.
 # AUTH_SECRET         Random string signing auth cookies. Required with the above.

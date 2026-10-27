@@ -352,6 +352,9 @@ export interface Env {
   SUBSCRIBE_PASSWORD?: string;
   /** Most push subscriptions accepted from non-admins. Default 100. */
   MAX_SUBSCRIPTIONS?: string;
+  /** Per-IP request limit for non-admins (a `[[ratelimits]]` binding). Unset:
+   *  no limit. See README "Traffic and cost". */
+  RATE_LIMITER?: RateLimit;
 }
 
 /** Who is looking at the dashboard, and whether they could log in. */
