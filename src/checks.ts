@@ -7,6 +7,7 @@ import type {
   PanelStatus,
   DashboardConfig,
 } from './types';
+import { probeSecretOnce } from './socket-probe';
 
 const DEFAULT_TIMEOUT = 10000; // 10 seconds
 
@@ -212,6 +213,19 @@ export async function runServiceChecks(
   const checks: CheckResult[] = [];
   const lookup = (url: string) => previousResults?.get(url);
 
+  // A secret service is one direct socket check; its host is `secret:<id>`.
+  const { secret } = service;
+  if (secret) {
+    if (source !== 'edge') return { checks: [] };
+    const result = await attemptWithRetry(
+      () => probeSecretOnce(primaryHost, secret, source),
+      lookup(`secret://${secret.id}`),
+      Date.now(),
+    );
+    if (result === null) return { checks, budgetExhausted: true };
+    return { checks: [result] };
+  }
+
   for (const host of hosts) {
     // HTTP checks
     if (service.http) {
@@ -329,6 +343,7 @@ export function parseConcurrency(raw?: string): ConcurrencyConfig {
  *  callers should keep headroom rather than have this over-report every tick. */
 export function estimateSubrequests(service: ServiceConfig, source: 'edge' | 'browser' = 'edge'): number {
   if (service.internal && source === 'edge') return 0;
+  if (service.secret) return source === 'edge' ? 1 : 0;
   const hosts = Array.isArray(service.host) ? service.host : [service.host];
   const httpCount = service.http ? (Array.isArray(service.http) ? service.http.length : 1) : 0;
   const httpsCount = service.https ? (Array.isArray(service.https) ? service.https.length : 1) : 0;
@@ -368,7 +383,7 @@ export async function runBudgetedChecks(
   // Flatten all eligible services
   const allServices = config.panels.flatMap(panel =>
     panel.services
-      .filter(svc => !(svc.internal && source === 'edge'))
+      .filter(svc => !(svc.internal && source === 'edge') && !(svc.secret && source !== 'edge'))
       .map(svc => ({
         service: svc,
         primaryHost: Array.isArray(svc.host) ? svc.host[0] : svc.host,

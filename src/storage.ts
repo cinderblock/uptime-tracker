@@ -482,7 +482,8 @@ export async function updateChartTiered(
   const now = Date.now();
 
   for (const r of freshResults) {
-    if (r.type !== 'https') continue;
+    // A secret service's one direct check is its primary check.
+    if (r.type !== 'https' && r.type !== 'secret') continue;
     let svc = state[r.service];
     if (!svc) {
       svc = state[r.service] = { primaryUrl: r.url, t1: [], t10: [], t30: [], t120: [] };
@@ -548,7 +549,7 @@ async function queryChartDataFromDB(
             latency DESC
         ) AS rn
       FROM checks
-      WHERE timestamp > ?4 AND type = 'https'
+      WHERE timestamp > ?4 AND type IN ('https', 'secret')
     )
     WHERE rn = 1
     ORDER BY service, url, timestamp ASC

@@ -1063,7 +1063,10 @@ export function renderDashboard(
                 if (uniqueHosts.length <= 1) {
                   // Single host: show type label (HTTPS/HTTP)
                   const primaryCheck = httpsChecks[0] || s.checks[0];
-                  if (primaryCheck) {
+                  if (primaryCheck && primaryCheck.type === 'secret') {
+                    const tip = "Checked directly, bypassing the proxy; the address isn't published";
+                    pillsHtml += \`<span class="pill pill-\${mainStatus}" data-tip="\${tip}">DIRECT</span>\`;
+                  } else if (primaryCheck) {
                     const tip = primaryCheck.type.toUpperCase() + ' endpoint is ' + (primaryCheck.status === 'up' ? 'reachable' : 'unreachable');
                     pillsHtml += \`<span class="pill pill-\${mainStatus}" data-tip="\${tip}">\${primaryCheck.type.toUpperCase()}</span>\`;
                   }
@@ -1927,7 +1930,10 @@ function renderService(
 
     if (uniqueHosts.length <= 1) {
       // Single host: show "HTTPS" pill as before
-      if (primaryCheck) {
+      if (primaryCheck?.type === 'secret') {
+        const tip = `Checked directly, bypassing the proxy; the address isn't published`;
+        pills.push(`<span class="pill ${mainPillClass}" data-tip="${tip}">DIRECT</span>`);
+      } else if (primaryCheck) {
         const label = primaryCheck.type.toUpperCase();
         const tip = `${label} endpoint is ${primaryCheck.status === 'up' ? 'reachable' : 'unreachable'}`;
         pills.push(`<span class="pill ${mainPillClass}" data-tip="${tip}">${label}</span>`);
@@ -1995,7 +2001,12 @@ function renderService(
         <div class="service-top">
           <div class="service-main">
             ${showBells ? `<button class="bell-btn" data-notify-key="${escapeHtml(s.host ?? s.name)}" data-notify-label="${escapeHtml(s.name)}" title="Notification settings for ${escapeHtml(s.name)}" aria-label="Notification settings for ${escapeHtml(s.name)}">🔔</button>` : ''}
-            <span class="service-name"><a href="${escapeHtml(primaryUrl)}" target="_blank" rel="noopener">${escapeHtml(s.name)}</a></span>
+            <span class="service-name">${
+              // A secret service's URL is an opaque id: nothing to link to.
+              primaryUrl.startsWith('secret://')
+                ? escapeHtml(s.name)
+                : `<a href="${escapeHtml(primaryUrl)}" target="_blank" rel="noopener">${escapeHtml(s.name)}</a>`
+            }</span>
             ${locationHtml}
             ${providerHtml}
           </div>

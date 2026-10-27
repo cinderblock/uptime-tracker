@@ -65,7 +65,38 @@ export interface ServiceConfig {
   link?: string;
   /** Label IDs this service belongs to (references DashboardConfig.labels) */
   labels?: string[];
+  /** @internal Set by the engine from the `SECRET_SERVICES` secret; never put
+   *  this in config.ts, or the address ends up in your repo. A service with a
+   *  probe is checked over a raw socket instead of fetch(), and its `host` is
+   *  the opaque `secret:<id>`. See src/secret-services.ts. */
+  secret?: SecretProbe;
 }
+
+/** How to reach a secret service. Only the checker ever reads it: no status,
+ *  log, error text or response carries `address` or `host`. */
+export interface SecretProbe {
+  id: string;
+  kind: 'http' | 'tcp';
+  address: string;
+  port: number;
+  /** `Host` header for `http` probes. */
+  host?: string;
+  path: string;
+  /** Expected status. Default 200, which also accepts any 2xx. */
+  expect?: number;
+  /** Expected `Location` (substring match), for an origin that redirects. */
+  redirect?: string;
+  /** Seconds. */
+  timeout: number;
+  /** Opens the socket. Injected so tests can stub it. */
+  connect: ConnectFn;
+}
+
+/** `connect()` from `cloudflare:sockets`, possibly behind a lazy import. */
+export type ConnectFn = (
+  address: { hostname: string; port: number },
+  options?: SocketOptions,
+) => Socket | Promise<Socket>;
 
 export interface PanelConfig {
   panel: string;
@@ -133,8 +164,9 @@ export interface CheckResult {
   service: string;
   /** Full URL that was checked */
   url: string;
-  /** Check type (http or https) */
-  type: 'http' | 'https';
+  /** Check type. `secret` is a direct socket check of a secret service; it
+   *  stands in for `https` as the service's primary check. */
+  type: 'http' | 'https' | 'secret';
   /** Up or down */
   status: CheckStatus;
   /** HTTP status code (if response received) */
@@ -355,6 +387,9 @@ export interface Env {
   /** Per-IP request limit for non-admins (a `[[ratelimits]]` binding). Unset:
    *  no limit. See README "Traffic and cost". */
   RATE_LIMITER?: RateLimit;
+  /** JSON array of services checked directly, whose address is never shown
+   *  (secret — wrangler secret put). See README "Secret services". */
+  SECRET_SERVICES?: string;
 }
 
 /** Who is looking at the dashboard, and whether they could log in. */

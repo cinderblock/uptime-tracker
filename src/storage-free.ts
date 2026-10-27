@@ -258,7 +258,7 @@ export async function getChartFromRollup(db: D1Database | undefined, retentionDa
                  latency DESC
              ) AS rn
            FROM checks
-           WHERE timestamp > ?1 AND type = 'https'
+           WHERE timestamp > ?1 AND type IN ('https', 'secret')
          )
          WHERE rn = 1
          ORDER BY service, url, timestamp ASC`,

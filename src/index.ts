@@ -1,6 +1,7 @@
 import type {
   Env,
   CheckResult,
+  ConnectFn,
   DashboardConfig,
   PanelStatus,
   ServiceStatus,
@@ -34,6 +35,7 @@ import { runAllChecks, runBudgetedChecks, parseConcurrency } from './checks';
 import { ddnsCacheTtlSeconds, isNthTick, resolvePlan, type PlanProfile } from './plan';
 import { rateLimitResponse } from './rate-limit';
 import { createGenerationMemo, type GenerationMemo } from './read-memo';
+import { createSecretServiceResolver, isSecretHost } from './secret-services';
 import {
   saveCurrentStatus,
   getCurrentStatus,
@@ -300,7 +302,18 @@ export interface WorkerOptions {
   config: DashboardConfig;
   /** Dynamic-DNS clients to watch. Omit for none. */
   ddnsClients?: DdnsClient[];
+  /** Opens sockets for secret services. Defaults to `cloudflare:sockets`;
+   *  tests pass a stub. */
+  connect?: ConnectFn;
 }
+
+/** `cloudflare:sockets` is only importable inside workerd, so load it on first
+ *  use. Under Bun (tests, `dev.ts`) nothing calls this unless a secret service
+ *  is configured without a stub. */
+const workerdConnect: ConnectFn = async (address, options) => {
+  const { connect } = await import('cloudflare:sockets');
+  return connect(address, options);
+};
 
 /**
  * Build a Workers handler bound to `options`.
@@ -313,12 +326,19 @@ export interface WorkerOptions {
  *
  * `src/worker.ts` is the standalone equivalent, for deploying this repo directly.
  */
-export function createWorker({ config, ddnsClients = [] }: WorkerOptions): ExportedHandler<Env> {
+export function createWorker({
+  config: baseConfig,
+  ddnsClients = [],
+  connect = workerdConnect,
+}: WorkerOptions): ExportedHandler<Env> {
   const memo = createGenerationMemo();
+  // The static config plus any SECRET_SERVICES, parsed once per secret value.
+  const resolveConfig = createSecretServiceResolver(baseConfig, connect);
   return {
     /** HTTP request handler */
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
       const url = new URL(request.url);
+      const config = resolveConfig(env.SECRET_SERVICES);
 
       // Pure and cheap (a lookup plus a few env parses) — resolving it per
       // request keeps the read path from having to guess which storage backend
@@ -547,6 +567,7 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
      *  controller has no `waitUntil` — use `ctx.waitUntil`. */
     async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
       try {
+        const config = resolveConfig(env.SECRET_SERVICES);
         const plan = resolvePlan(env);
         console.log(`Running scheduled checks (plan: ${plan.tier})...`);
 
@@ -1249,7 +1270,8 @@ async function recordTransitions(
         label: svc.name,
         up,
         ts: now,
-        link: svc.host ? `https://${svc.host}` : undefined,
+        // A secret service's host is an opaque id, not something to link to.
+        link: svc.host && !isSecretHost(svc.host) ? `https://${svc.host}` : undefined,
         detail: svc.reason,
       });
     }
