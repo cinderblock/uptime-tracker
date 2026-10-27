@@ -343,4 +343,16 @@ export interface Env {
   /** Bearer token for POST /api/usage (secret — wrangler secret put). Unset
    *  disables the endpoint; it is never open, since it writes to the database. */
   USAGE_TOKEN?: string;
+  /** "true" turns on the read-only public view: anyone may see status, only a
+   *  logged-in admin sees DDNS, cost, errors and the admin pages. Unset keeps
+   *  the all-or-nothing behaviour above. See README "Public mode". */
+  PUBLIC_DASHBOARD?: string;
+}
+
+/** Who is looking at the dashboard, and whether they could log in. */
+export interface DashboardAccess {
+  /** Sees everything: DDNS, cost, errors, history deletion, admin pages. */
+  admin: boolean;
+  /** A password is set: offer non-admins an Admin link, and admins Log out. */
+  loginAvailable: boolean;
 }

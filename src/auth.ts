@@ -139,6 +139,102 @@ export function isPublicPath(pathname: string): boolean {
   return PUBLIC_PATHS.has(pathname);
 }
 
+// ── Public mode ──────────────────────────────────────────────────────────────
+//
+// PUBLIC_DASHBOARD=true splits visitors in two. Anyone may read the status
+// page; only a logged-in admin reaches everything else. This is an ALLOWLIST
+// on purpose — an endpoint added later stays admin-only until someone decides
+// otherwise, rather than leaking by default.
+
+/** Is the read-only public view turned on? */
+export function isPublicMode(env: Env): boolean {
+  return env.PUBLIC_DASHBOARD === 'true';
+}
+
+/** Read-only paths a public-mode visitor may reach without logging in.
+ *  Everything here must be safe to serve to anyone: handlers check `admin`
+ *  and strip DDNS, cost and other admin-only data from the response. */
+const PUBLIC_MODE_PATHS = new Set(['/', '/api/poll']);
+
+/** GET-only additions: the same path also has an admin-only write method. */
+const PUBLIC_MODE_GET_PATHS = new Set(['/api/history']);
+
+export function isPublicModePath(pathname: string, method: string): boolean {
+  if (PUBLIC_MODE_PATHS.has(pathname)) return true;
+  return method === 'GET' && PUBLIC_MODE_GET_PATHS.has(pathname);
+}
+
+/**
+ * Is this request from an admin?
+ *
+ * | PUBLIC_DASHBOARD | DASHBOARD_PASSWORD | Admin when                        |
+ * | ---------------- | ------------------ | --------------------------------- |
+ * | off              | unset              | always (fully open, as before)    |
+ * | off              | set                | valid cookie (gated, as before)   |
+ * | on               | set                | valid cookie                      |
+ * | on               | unset              | never — no way to log in          |
+ */
+export async function isAdminRequest(env: Env, request: Request): Promise<boolean> {
+  if (!isAuthEnabled(env)) return !isPublicMode(env);
+  return verifyToken(env, getAuthCookie(request));
+}
+
+/** `Set-Cookie` value that clears the session. */
+export function buildLogoutCookie(secure: boolean): string {
+  return `${AUTH_COOKIE}=; Path=/; Max-Age=0; HttpOnly;${secure ? ' Secure;' : ''} SameSite=Strict`;
+}
+
+// ── Login throttling ─────────────────────────────────────────────────────────
+//
+// A shared passphrase on a public page will be guessed at. Failed attempts are
+// counted per client IP in D1 (not KV: the free plan allows only 1,000 KV
+// writes a day, and an attacker could burn them). Once an IP is locked out,
+// further attempts are refused WITHOUT a write, so a flood costs one row.
+
+export const LOGIN_MAX_FAILURES = 10;
+export const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+
+/** Seconds until this IP may try again, or 0 if it may try now. */
+export async function loginRetryAfter(db: D1Database | undefined, ip: string, now = Date.now()): Promise<number> {
+  if (!db) return 0;
+  const row = await db
+    .prepare(`SELECT window_start, failures FROM login_attempts WHERE ip = ?`)
+    .bind(ip)
+    .first<{ window_start: number; failures: number }>();
+  if (!row || now - row.window_start >= LOGIN_WINDOW_MS) return 0;
+  if (row.failures < LOGIN_MAX_FAILURES) return 0;
+  return Math.ceil((row.window_start + LOGIN_WINDOW_MS - now) / 1000);
+}
+
+/** Count one failed attempt, starting a fresh window if the old one lapsed. */
+export async function recordLoginFailure(db: D1Database | undefined, ip: string, now = Date.now()): Promise<void> {
+  if (!db) return;
+  await db
+    .prepare(
+      `INSERT INTO login_attempts (ip, window_start, failures) VALUES (?1, ?2, 1)
+       ON CONFLICT(ip) DO UPDATE SET
+         failures     = CASE WHEN ?2 - window_start >= ?3 THEN 1  ELSE failures + 1 END,
+         window_start = CASE WHEN ?2 - window_start >= ?3 THEN ?2 ELSE window_start END`,
+    )
+    .bind(ip, now, LOGIN_WINDOW_MS)
+    .run();
+}
+
+/** A successful login clears the IP's count. */
+export async function clearLoginFailures(db: D1Database | undefined, ip: string): Promise<void> {
+  if (!db) return;
+  await db.prepare(`DELETE FROM login_attempts WHERE ip = ?`).bind(ip).run();
+}
+
+/** Drop lapsed windows so the table can't grow without bound. */
+export async function cleanupLoginAttempts(db: D1Database | undefined, now = Date.now()): Promise<void> {
+  if (!db) return;
+  await db
+    .prepare(`DELETE FROM login_attempts WHERE window_start < ?`)
+    .bind(now - LOGIN_WINDOW_MS)
+    .run();
+}
+
 /**
  * Bearer-token check for the usage ingest endpoint.
  *

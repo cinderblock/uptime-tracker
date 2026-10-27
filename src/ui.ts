@@ -1,4 +1,11 @@
-import type { DashboardConfig, GitHubWorkflowConfig, LabelDefinition, PanelStatus, ServiceStatus } from './types';
+import type {
+  DashboardAccess,
+  DashboardConfig,
+  GitHubWorkflowConfig,
+  LabelDefinition,
+  PanelStatus,
+  ServiceStatus,
+} from './types';
 import { chartIntervals, type PlanProfile } from './plan';
 import type { ChartData, DdnsLogEntry, UptimeByPeriod } from './storage';
 import { renderCostPanelHtml, COST_PANEL_CSS, type CostPanelData } from './cost/ui';
@@ -79,6 +86,8 @@ export function renderDashboard(
   uptime?: Record<string, UptimeByPeriod>,
   charts?: ChartData,
   cost?: CostPanelData,
+  // Defaults to admin: callers that predate public mode keep the full view.
+  access: DashboardAccess = { admin: true, loginAvailable: false },
 ): string {
   const panels = status?.panels ?? [];
   const lastUpdate = status?.lastUpdate;
@@ -244,6 +253,9 @@ export function renderDashboard(
     .chart-clear { position: absolute; top: 0; left: 2px; font-size: 0.625rem; color: var(--text-muted); cursor: pointer; opacity: 0; transition: opacity 0.15s; background: none; border: none; font-family: inherit; padding: 0 0.25rem; z-index: 5; }
     .chart-clear:hover { color: var(--color-down); opacity: 1; }
     .chart-container:hover .chart-clear { opacity: 0.7; }
+    /* Public viewers can't delete history or open the errors page. */
+    .viewer-public .chart-clear { display: none; }
+    .viewer-public .chart-container { cursor: default; }
 
     .modal-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; z-index: 100; opacity: 0; pointer-events: none; transition: opacity 0.15s; }
     .modal-overlay.visible { opacity: 1; pointer-events: auto; }
@@ -365,13 +377,19 @@ export function renderDashboard(
     ${COST_PANEL_CSS}
   </style>
 </head>
-<body>
+<body${access.admin ? '' : ' class="viewer-public"'}>
   <div class="header">
     <h1>Uptime Monitor</h1>
     <div class="header-right">
       <span class="pill pill-large pill-clickable ${totalDown === 0 ? 'pill-up' : 'pill-down'}" id="status-filter" title="Click to filter">${totalDown === 0 ? 'All Systems Operational' : `${totalDown} Issue${totalDown > 1 ? 's' : ''}`}</span>
-      <a href="/errors" class="btn" title="View recent check errors">Errors</a>
-      <a href="/ddns" class="btn" title="View DDNS log">DDNS</a>
+      ${
+        access.admin
+          ? `<a href="/errors" class="btn" title="View recent check errors">Errors</a>
+      <a href="/ddns" class="btn" title="View DDNS log">DDNS</a>`
+          : ''
+      }
+      ${!access.admin && access.loginAvailable ? `<a href="/login" class="btn" title="Log in as an admin">Admin</a>` : ''}
+      ${access.admin && access.loginAvailable ? `<a href="/logout" class="btn" title="Log out">Log out</a>` : ''}
       ${lastUpdate ? `<span class="updated">${formatTime(lastUpdate)}</span>` : ''}
       <span class="online-indicator online" id="online-indicator">online</span>
       ${vapidPublicKey ? `<button class="btn btn-icon" id="notif-btn" title="Enable push notifications" aria-label="Toggle notifications">🔕</button>` : ''}
@@ -513,6 +531,8 @@ export function renderDashboard(
   </div>
 
   <script>
+    const IS_ADMIN = ${access.admin ? 'true' : 'false'};
+
     // Theme toggle
     const themeToggle = document.getElementById('theme-toggle');
     const themeIcon = themeToggle.querySelector('.theme-icon');
@@ -1268,8 +1288,10 @@ export function renderDashboard(
       });
     }
 
-    // Click chart to see errors for that service (but not when clicking clear button)
+    // Click chart to see errors for that service (but not when clicking clear button).
+    // The errors page is admin-only, so public viewers get no click-through.
     document.addEventListener('click', (e) => {
+      if (!IS_ADMIN) return;
       if (e.target.closest('.chart-clear')) return;
       const chart = e.target.closest('.chart-container');
       if (!chart) return;

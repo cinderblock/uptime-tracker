@@ -10,15 +10,23 @@ import type {
   NotificationSettings,
   DdnsClient,
   LaneObservation,
+  DashboardAccess,
+  TransitionsState,
 } from './types';
 import {
   assertAuthConfig,
   buildAuthCookie,
-  getAuthCookie,
+  buildLogoutCookie,
+  cleanupLoginAttempts,
+  clearLoginFailures,
+  isAdminRequest,
   isAuthEnabled,
+  isPublicMode,
+  isPublicModePath,
   isPublicPath,
+  loginRetryAfter,
+  recordLoginFailure,
   verifyPassword,
-  verifyToken,
   verifyUsageToken,
 } from './auth';
 import { runAllChecks, runBudgetedChecks, parseConcurrency } from './checks';
@@ -221,7 +229,7 @@ function escapeHtml(str: string): string {
 }
 
 /** Render the login page */
-function renderLoginPage(error?: string): Response {
+function renderLoginPage(error?: string, status?: number, headers?: Record<string, string>): Response {
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -267,8 +275,8 @@ function renderLoginPage(error?: string): Response {
 </html>`;
 
   return new Response(html, {
-    status: error ? 401 : 200,
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    status: status ?? (error ? 401 : 200),
+    headers: { 'Content-Type': 'text/html; charset=utf-8', ...headers },
   });
 }
 
@@ -314,6 +322,14 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
           return new Response('Authentication is not configured on this deployment.', { status: 404 });
         }
 
+        const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown';
+        const retryAfter = await loginRetryAfter(env.DB, ip);
+        if (retryAfter > 0) {
+          return renderLoginPage(`Too many attempts. Try again in ${Math.ceil(retryAfter / 60)} min.`, 429, {
+            'Retry-After': String(retryAfter),
+          });
+        }
+
         const formData = await request.formData();
         const passphrase = formData.get('passphrase') as string;
 
@@ -322,9 +338,11 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
         }
 
         if (!(await verifyPassword(env, passphrase))) {
+          await recordLoginFailure(env.DB, ip);
           return renderLoginPage('Invalid passphrase');
         }
 
+        await clearLoginFailures(env.DB, ip);
         return new Response(null, {
           status: 302,
           headers: {
@@ -334,18 +352,34 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
         });
       }
 
-      // Gate everything except static assets, the health probe, and the login page.
-      // When DASHBOARD_PASSWORD is unset the dashboard is intentionally public.
-      if (isAuthEnabled(env) && !isPublicPath(url.pathname)) {
-        if (!(await verifyToken(env, getAuthCookie(request)))) {
-          return renderLoginPage();
-        }
+      if (url.pathname === '/logout') {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: '/', 'Set-Cookie': buildLogoutCookie(url.protocol === 'https:') },
+        });
       }
+
+      // Gate everything except static assets, the health probe, and the login
+      // page — and, in public mode, the read-only status view. With neither a
+      // password nor public mode, everyone is admin (the original open mode).
+      const admin = await isAdminRequest(env, request);
+      const publicMode = isPublicMode(env);
+      if (url.pathname === '/login') {
+        // An explicit visit to the login page (the public view's Admin link).
+        if (admin || !isAuthEnabled(env)) return Response.redirect(new URL('/', url).toString(), 302);
+        return renderLoginPage();
+      }
+      if (!admin && !isPublicPath(url.pathname) && !(publicMode && isPublicModePath(url.pathname, request.method))) {
+        if (isAuthEnabled(env)) return renderLoginPage();
+        return new Response('Not Found', { status: 404 });
+      }
+      // Offer an Admin link (public mode) or Log out only where a password exists.
+      const access: DashboardAccess = { admin, loginAvailable: isAuthEnabled(env) };
 
       try {
         switch (url.pathname) {
           case '/':
-            return handleDashboard(config, env, plan);
+            return handleDashboard(config, env, plan, access);
 
           case '/manifest.json':
             return new Response(MANIFEST_JSON, {
@@ -378,7 +412,7 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
             });
 
           case '/api/poll':
-            return handleApiPoll(config, request, env, plan);
+            return handleApiPoll(config, request, env, plan, admin);
 
           case '/api/history':
             if (request.method === 'DELETE') return handleDeleteHistory(request, env);
@@ -439,7 +473,9 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
         console.error('Request error:', error.message);
         console.error('Stack:', error.stack);
 
-        // Return detailed error page for debugging (behind auth anyway)
+        // Detailed error page for debugging, admins only. A public-mode visitor
+        // gets a bare 500, since a stack trace can name internals.
+        if (!admin) return new Response('Internal Server Error', { status: 500 });
         const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -628,6 +664,8 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
 
           const usageDeleted = await cleanupUsageLog(env.DB);
           if (usageDeleted > 0) console.log(`Cleaned up ${usageDeleted} old usage_log entries`);
+
+          await cleanupLoginAttempts(env.DB);
         }
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
@@ -1308,19 +1346,36 @@ function mergeConfigWithStatus(
 /** Render the main dashboard page.
  *  Uses streaming: HTML with status + uptime renders immediately,
  *  chart data is appended at the end when the slower query finishes. */
-async function handleDashboard(config: DashboardConfig, env: Env, plan: PlanProfile): Promise<Response> {
+/** Timeline lanes a viewer may see. DDNS lanes are keyed by hostname and
+ *  reveal home networks, so they're admin-only like the DDNS log itself. */
+function visibleTransitions(transitions: TransitionsState, admin: boolean): TransitionsState {
+  if (admin) return transitions;
+  return Object.fromEntries(Object.entries(transitions).filter(([key]) => !key.startsWith('ddns:')));
+}
+
+async function handleDashboard(
+  config: DashboardConfig,
+  env: Env,
+  plan: PlanProfile,
+  access: DashboardAccess,
+): Promise<Response> {
+  const { admin } = access;
   // Start all queries in parallel — chart query is slow, don't block HTML on it
   const chartsPromise = getChartData(plan, env.KV, env.DB);
-  const transitionsPromise = getTransitions(plan, env.KV, env.DB);
+  const transitionsPromise = getTransitions(plan, env.KV, env.DB).then(t => visibleTransitions(t, admin));
+  // DDNS (home IPs) and cost data are admin-only, so don't even query them otherwise.
   const [cached, ddnsLog, uptime, costData] = await Promise.all([
     getCurrentStatus(plan, env.KV, env.DB),
-    getRecentDdnsLog(plan, env.KV, env.DB, undefined, 50),
+    admin ? getRecentDdnsLog(plan, env.KV, env.DB, undefined, 50) : [],
     getMultiPeriodUptime(plan, env.KV, env.DB),
-    fetchCostPanelData(env),
+    admin ? fetchCostPanelData(env) : undefined,
   ]);
   const merged = mergeConfigWithStatus(config, cached);
 
-  const html = renderDashboard(plan, config, merged, ddnsLog, env.VAPID_PUBLIC_KEY, uptime, undefined, costData);
+  // Notification settings are still deployment-wide, so only an admin may
+  // change them. Hide the bells from everyone else.
+  const vapidKey = admin ? env.VAPID_PUBLIC_KEY : undefined;
+  const html = renderDashboard(plan, config, merged, ddnsLog, vapidKey, uptime, undefined, costData, access);
 
   // Stream: send HTML immediately, then append chart data when ready
   const encoder = new TextEncoder();
@@ -1369,6 +1424,7 @@ async function handleApiPoll(
   request: Request,
   env: Env,
   plan: PlanProfile,
+  admin: boolean,
 ): Promise<Response> {
   const url = new URL(request.url);
   const full = url.searchParams.has('full');
@@ -1378,17 +1434,17 @@ async function handleApiPoll(
       getCurrentStatus(plan, env.KV, env.DB),
       getMultiPeriodUptime(plan, env.KV, env.DB),
       getChartData(plan, env.KV, env.DB),
-      getRecentDdnsLog(plan, env.KV, env.DB, undefined, 50),
+      admin ? getRecentDdnsLog(plan, env.KV, env.DB, undefined, 50) : [],
       getTransitions(plan, env.KV, env.DB),
     ]);
     const status = mergeConfigWithStatus(config, cached);
-    return jsonResponse({ ...status, uptime, charts, ddnsLog, transitions });
+    return jsonResponse({ ...status, uptime, charts, ddnsLog, transitions: visibleTransitions(transitions, admin) });
   }
 
   // Lightweight poll: status + ddns only
   const [cached, ddnsLog] = await Promise.all([
     getCurrentStatus(plan, env.KV, env.DB),
-    getRecentDdnsLog(plan, env.KV, env.DB, undefined, 50),
+    admin ? getRecentDdnsLog(plan, env.KV, env.DB, undefined, 50) : [],
   ]);
   const status = mergeConfigWithStatus(config, cached);
   return jsonResponse({ ...status, ddnsLog });

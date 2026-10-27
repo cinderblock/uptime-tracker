@@ -176,9 +176,20 @@ counts against the 3 MB compressed script limit instead.
 
 ## Authentication
 
-**By default the dashboard is public.** It exposes your monitored hostnames and
-their current health, which is often exactly what a status page should do. To
-gate it behind a passphrase:
+There are three modes:
+
+| Mode               | Set                                     | Anonymous visitors               | Admin                               |
+| ------------------ | --------------------------------------- | -------------------------------- | ----------------------------------- |
+| **Open** (default) | nothing                                 | everything, admin pages included | everyone                            |
+| **Gated**          | `DASHBOARD_PASSWORD` + `AUTH_SECRET`    | the login page only              | after login                         |
+| **Public**         | the above + `PUBLIC_DASHBOARD = "true"` | the status page, read-only       | after login, via the **Admin** link |
+
+**Open mode really is open.** Anyone can delete check history, submit probe
+results, change notification settings and list push subscribers. It's meant for
+a dashboard nobody else can reach. For anything on the internet, use gated or
+public mode.
+
+To set a passphrase:
 
 ```bash
 wrangler secret put DASHBOARD_PASSWORD   # the passphrase
@@ -189,6 +200,25 @@ Both are required together; setting only the password fails loudly at startup
 rather than serving unprotected. The session cookie is an HMAC-signed token with
 an expiry covered by the signature — not a hash of the password — so the stored
 value alone can't be replayed. Rotating `AUTH_SECRET` logs everyone out.
+
+Failed logins are throttled per client IP: 10 failures locks that IP out for
+15 minutes. Counts live in D1 (migration `0011`), not KV, so a flood of guesses
+can't use up the free plan's KV write allowance.
+
+### Public mode
+
+`PUBLIC_DASHBOARD = "true"` in `[vars]` makes the status page readable by anyone,
+while everything else stays behind the login. Anonymous visitors get:
+
+- service status, uptime, latency charts and the event timeline;
+- **no** DDNS log or DDNS timeline lanes (they reveal home networks), cost panel,
+  errors page, history deletion, probe submission, or subscriber admin;
+- no push notification controls. Notification settings are deployment-wide, so
+  only an admin may change them.
+
+Which paths are public is an **allowlist** in `src/auth.ts`. A new endpoint
+stays admin-only until it's added there on purpose. Without a password, public
+mode has no admin at all: admin paths return 404 rather than falling open.
 
 ## Push notifications (optional)
 

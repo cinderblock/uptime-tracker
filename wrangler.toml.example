@@ -71,8 +71,13 @@ VAPID_SUBJECT = "mailto:you@example.com"     # mailto: or https:// identifying t
 #   wrangler secret put CF_ANALYTICS_TOKEN   # needs Account Analytics:Read
 CF_ACCOUNT_ID = ""
 
+# ── Public mode (optional) ───────────────────────────────────────────────────
+# "true": anyone may read the status page; DDNS, cost, errors and admin pages
+# need a login (DASHBOARD_PASSWORD below). See README "Public mode".
+# PUBLIC_DASHBOARD = "true"
+
 # ── Secrets (never put these here — use `wrangler secret put <NAME>`) ────────
-# DASHBOARD_PASSWORD  Passphrase gating the dashboard. UNSET = PUBLIC DASHBOARD.
+# DASHBOARD_PASSWORD  Passphrase gating the dashboard. UNSET = FULLY OPEN, admin included.
 # AUTH_SECRET         Random string signing auth cookies. Required with the above.
 # VAPID_PRIVATE_KEY   Web Push signing key.
 # GITHUB_TOKEN        Only needed for private repos in the workflow badges panel.
