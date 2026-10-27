@@ -1,7 +1,7 @@
 # Public mode, per-device notifications, and secret services
 
 **Plan path:** `plans/public-mode-and-per-device-notifications.md`
-**Status:** A, B and D built on branch `public-mode-notifications`, 106 tests passing. Next: deploy to the SVDSA test deployment (approved; blocked on Cameron's wrangler login), then port D to ops, then C and E.
+**Status:** A, B and D built on branch `public-mode-notifications` and deployed to the SVDSA test deployment; D is live on ops. C built on branch `secret-services` (cut from `public-mode-notifications`), 122 tests passing, not deployed. Next: real-device push check, then C on the test deployment with Helena's address, then E.
 **Related:** `~/git/svdsa/stack/plans/uptime-to-chapter-account.md` covers the SVDSA
 deployment that motivates this work.
 
@@ -117,22 +117,55 @@ notify_recovery, urgency, updated_at)`, with primary key
 - **UI.** Bells show this device's settings. Clicking a bell on a device that
   isn't subscribed offers to subscribe first.
 
-### C. Secret services
+### C. Secret services (as built, branch `secret-services`)
 
-- **Where they're defined.** A Worker secret `SECRET_SERVICES` holds base64 JSON
-  using the same shape as `config.ts` services, plus a panel name. It is merged in
-  at runtime. Base64 is there because GitLab can't mask raw JSON, and CI is what
-  sets the secret.
-- **Keys.** Opaque keys (`secret:<id>`) rather than hosts, so the
-  notification-settings keys, D1 rows exposed through APIs, and the timeline never
-  carry the host.
-- **Who sees them.** Admins only: hidden entirely from public viewers, and only
-  subscribable by a logged-in device. Push bodies use the display name, never the
-  host.
-- **The main cost is an audit.** Every API that returns check data (`/api/errors`,
-  history, timeline, status JSON) must filter or redact secret services for public
-  viewers, **including error text**, which can contain the hostname or IP. Tests are
-  needed for each endpoint.
+- **Where they're defined.** A Worker secret `SECRET_SERVICES` holds a plain JSON
+  array (not base64: it's pasted into the Cloudflare dashboard or `wrangler secret
+put`, never set by CI, so GitLab masking doesn't apply). Entry shape:
+  `{id, name, panel?, labels?, address, kind: 'http'|'tcp', port?, host?, path?,
+expect?, redirect?, timeout?}`. `host` (the `Host` header) is required for `http`;
+  `path`, `expect` and `redirect` are `http`-only. Defaults: port 80 (`http`) or
+  443 (`tcp`), path `/`, timeout 10 s, panel "Direct checks". See README "Secret
+  services" for the full table.
+- **Validation is strict and silent about values.** Unknown fields, bad ids,
+  duplicate ids, a non-bare address, CR/LF or spaces in `host`/`path`, port 25, and
+  `http`-only fields on `tcp` all reject the whole secret. Errors name the entry
+  index and field only. JSON parse errors aren't passed on at all, because V8's
+  message quotes the input. A bad secret turns secret services off and leaves the
+  rest of the tick alone. It's parsed once per distinct value per isolate
+  (`createSecretServiceResolver`).
+- **How they join the pipeline.** Each entry becomes an ordinary `ServiceConfig`
+  with `host: 'secret:<id>'` and an internal `secret` probe field, added to the
+  effective config that `fetch()` and `scheduled()` both resolve first. So status,
+  uptime, charts, transitions, bells and per-device notifications all work
+  unchanged, keyed `secret:<id>`. `runServiceChecks` sends secret services to
+  `src/socket-probe.ts`; `estimateSubrequests` counts each as 1, and
+  `attemptWithRetry` applies as for any check.
+- **The probe.** `http`: `GET <path> HTTP/1.1` with the `Host` header over a plain
+  socket. It reads the status line and headers (capped at 16 KB) and validates like
+  the fetch checks (status, or a `Location` substring). `tcp`: `socket.opened`.
+  Results carry `type: 'secret'` and `url: 'secret://<id>'`; error text has the
+  address and Host scrubbed (`[hidden]`, case-insensitive) before it's stored or
+  logged. `connect` is injected through `createWorker({ connect })`. The default
+  lazily imports `cloudflare:sockets`, so Bun tests never load it; a wrangler
+  dry-run bundle keeps it as an external dynamic import.
+- **Charts.** `type IN ('https', 'secret')` in the paid backfill and free raw-chart
+  queries, and in `updateChartTiered`, so the direct check is the service's
+  primary chart series.
+- **UI.** A **DIRECT** pill (server and client render) and no link on the name,
+  since the URL is an opaque id. The timeline lane gets no link either.
+- **Who sees them: everyone sees the stats; no one sees the address.** Decided by
+  Cameron, 2026-10-26: "I want the uptime stats to be public, as long as we can
+  keep the real ip/dns hidden". So secret services aren't filtered for public
+  viewers; instead nothing anywhere holds the address or Host, admin views
+  included.
+- **Redaction audit** (`test/secret-services.test.ts`). It runs a real tick and
+  real requests, public and admin, with a probe rigged so the origin's reply and
+  errors quote distinctive address and Host strings: dashboard, polls, history,
+  `/api/errors`, `/errors`, the subscriptions page and API, and notification
+  settings. It then checks every response body and header, every D1 table, every
+  console line, and every push payload (decrypted with the device key). A mutation
+  test (scrubbing removed) makes it fail.
 
 ## Decisions already made (don't re-ask)
 
@@ -142,6 +175,10 @@ notify_recovery, urgency, updated_at)`, with primary key
 - Build upstream in this repo on a branch, and test on the SVDSA test deployment
   (ops.isozilla.com doesn't run the engine yet). Decided 2026-10-26.
 - `MAX_SUBSCRIPTIONS` defaults to 100.
+- **Secret services: stats public, address hidden from everyone** (Cameron,
+  2026-10-26). The first use is a direct check of Helena, the chapter's origin
+  server, bypassing Cloudflare's proxy, kept in the private config so Helena's
+  public IP isn't leaked.
 - D is wanted here **and on Cameron's ops deployment** ("do it. on my OPS as well",
   2026-10-26). Ops still runs its own copy, so D gets ported there separately.
 - Webhooks: send every event type, with metadata so the receiver can filter. Slack is
@@ -155,8 +192,10 @@ notify_recovery, urgency, updated_at)`, with primary key
    uses no Slack app slot. Slack's incoming-webhook format would be an option for
    posting direct. Today Web Push is the only alert channel, and Worker
    exceptions only reach Cloudflare's logs.
-2. **Who should see secret services?** I recommend admins only. The alternative is
-   showing a redacted placeholder ("Private service: up") to the public.
+2. **What does Helena's origin answer on plain HTTP?** It decides the entry:
+   a redirect to HTTPS (`redirect: "https://siliconvalleydsa.org/"`) or a 200.
+   If its firewall only allows Cloudflare's ranges, check that a Worker socket
+   gets through (undocumented; see Findings).
 
 ## Progress log
 
@@ -193,7 +232,12 @@ notify_recovery, urgency, updated_at)`, with primary key
 - [ ] Verify on real devices: subscribe, per-device bells, a real outage alert, the
       subscribe code, and the admin login.
 - [ ] Merge the branch to `master`.
-- [ ] C. Secret services and the endpoint redaction audit, with tests.
+- [x] C. Secret services and the endpoint redaction audit (branch
+      `secret-services`, `0f7950b`, plus docs). 122 tests, typecheck and
+      prettier pass; a wrangler dry-run bundle builds.
+- [ ] C on the SVDSA test deployment: point the submodule at `secret-services`,
+      put Helena's entry in `SECRET_SERVICES` (Cameron supplies the address
+      privately), deploy, and confirm the DIRECT check goes green.
 
 ## Findings / gotchas
 
@@ -211,6 +255,24 @@ notify_recovery, urgency, updated_at)`, with primary key
   rather than built on the Cache API.
 - Transitions are written _after_ the status blob in a tick, so they aren't memoized:
   a view between the two writes would otherwise pin old transitions for a whole tick.
+- **Measured on Cloudflare's edge, 2026-10-26** (a throwaway `wrangler dev --remote`
+  probe on the test account, against a non-Cloudflare IP):
+  - `fetch('https://<ip>/')` returns **403**: Workers can't fetch raw IPs.
+  - `connect()` from `cloudflare:sockets` to `<ip>:80`, plain HTTP with a `Host`
+    header, works (`HTTP/1.1 301 Moved Permanently`).
+  - TLS to an IP fails certificate verification ("IP address mismatch"), with
+    `secureTransport: 'on'` and with `'starttls'` plus `startTls({
+expectedServerHostname })`, at both compatibility dates tried. So
+    **certificate-verified HTTPS by IP is impossible from a Worker**, and secret
+    services check plain HTTP or TCP.
+- Whether a Worker's outbound sockets come from Cloudflare's published ranges (so
+  an origin firewall allowing only those lets the check in) isn't documented.
+  Confirm it on Helena.
+- The D1 test shims in the older test files share one statement object across
+  `bind()` calls, so a `batch()` of binds off one prepared statement writes the
+  last row N times. `test/secret-services.test.ts` uses a shim whose `bind`
+  returns a new statement; the others still have the bug (harmless for what they
+  assert).
 - Bash heredocs in this environment choke on large quoted Python bodies. Write the
   edit script to a file, or use small Edit calls.
 

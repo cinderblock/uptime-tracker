@@ -93,6 +93,8 @@ CF_ACCOUNT_ID = ""
 # AUTH_SECRET         Random string signing auth cookies. Required with the above.
 # VAPID_PRIVATE_KEY   Web Push signing key.
 # SUBSCRIBE_PASSWORD  Optional code a non-admin must enter to subscribe to push.
+# SECRET_SERVICES     Optional JSON array of services checked directly, whose
+#                     address is never shown. See README "Secret services".
 # GITHUB_TOKEN        Only needed for private repos in the workflow badges panel.
 # CF_ANALYTICS_TOKEN  Cost monitor.
 

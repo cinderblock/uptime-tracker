@@ -245,6 +245,76 @@ With a custom domain, a zone rate-limiting rule (the Free plan includes one) can
 also stop a flood before the Worker runs at all. Then set `workers_dev = false`,
 so the `workers.dev` address can't be used to get around it.
 
+## Secret services (optional)
+
+Some things are worth monitoring but not worth advertising. The usual one is an
+origin server behind Cloudflare's proxy: checking the public hostname only proves
+the proxy answers, and putting the origin's IP in a public repo or on a public
+page would undo what the proxy hides.
+
+List those in a Worker secret instead of `config.ts`:
+
+```bash
+wrangler secret put SECRET_SERVICES   # paste the JSON array
+```
+
+```json
+[
+  {
+    "id": "origin",
+    "name": "Origin server",
+    "panel": "Direct checks",
+    "address": "203.0.113.10",
+    "kind": "http",
+    "host": "www.example.org",
+    "path": "/",
+    "redirect": "https://www.example.org/"
+  },
+  { "id": "db", "name": "Database port", "address": "203.0.113.11", "kind": "tcp", "port": 5432 }
+]
+```
+
+| Field      | Meaning                                                                                    |
+| ---------- | ------------------------------------------------------------------------------------------ |
+| `id`       | Opaque id, 1–40 lowercase letters, digits or dashes. Keys become `secret:<id>`.            |
+| `name`     | Public display name. Don't put the address in it.                                          |
+| `panel`    | Optional. An existing panel's name, or a new one. Default "Direct checks".                 |
+| `labels`   | Optional label ids, as for ordinary services.                                              |
+| `address`  | IP or hostname to connect to. Never shown.                                                 |
+| `kind`     | `http` (a plain HTTP/1.1 request) or `tcp` (the port accepts a connection).                |
+| `port`     | Optional. Default 80 for `http`, 443 for `tcp`. Not 25, which Workers block.               |
+| `host`     | `http` only, required: the `Host` header. Never shown.                                     |
+| `path`     | `http` only. Default `/`.                                                                  |
+| `expect`   | `http` only. Expected status, default 200 (any 2xx).                                       |
+| `redirect` | `http` only. Expected `Location` (substring match), for an origin that redirects to HTTPS. |
+| `timeout`  | Optional, 1–30 seconds. Default 10.                                                        |
+
+Each entry shows up as an ordinary service under its display name, with a
+**DIRECT** pill: status, latency chart, uptime, timeline and push notifications
+all work, for public viewers too. Nothing anywhere carries the address or the
+`Host`, admins included: services are keyed `secret:<id>`, history stores
+`secret://<id>`, and any error text has both scrubbed before it's stored or
+logged. If you need the address, it's in the secret. A malformed secret is
+logged by entry and field (never by value) and turns secret services off
+without affecting anything else.
+
+**Limits.**
+
+- **No HTTPS.** Workers can't `fetch()` an IP (Cloudflare returns 403), and TLS
+  to an IP fails certificate verification ("IP address mismatch"), even with
+  `expectedServerHostname`. So the check is plain HTTP over a raw socket
+  (`cloudflare:sockets`) with a `Host` header, which proves the web server
+  answers for that site, or a bare TCP connect. An origin that redirects all
+  HTTP to HTTPS still makes a good `http` check: expect the redirect.
+- **Each check is one connection** against the per-tick check budget, retried
+  once after a failure if it was up last time, like any other check.
+- **Hiding the address here doesn't make it secret.** DNS history services often
+  remember what a hostname pointed at before it went behind the proxy. The
+  real protection for an origin is a firewall that only accepts Cloudflare's IP
+  ranges. Workers' outbound sockets should come from those ranges as well, but
+  that isn't documented: confirm the check still passes after tightening the
+  firewall.
+
 ## Push notifications (optional)
 
 ```bash
@@ -321,22 +391,24 @@ which case the panel stays hidden and no DDNS alerting runs.
 
 ## Source layout
 
-| File                | Purpose                                                          |
-| ------------------- | ---------------------------------------------------------------- |
-| `worker.ts`         | Standalone entry — the only file that imports `config.ts`        |
-| `index.ts`          | The library: `createWorker()`, request + cron handlers, routing  |
-| `plan.ts`           | Free/paid plan profiles — every tunable and why                  |
-| `config.example.ts` | What to monitor (copy to `config.ts`)                            |
-| `types.ts`          | Shared interfaces                                                |
-| `checks.ts`         | Check execution, concurrency pool, subrequest budgeting          |
-| `storage.ts`        | D1 + KV access, history, uptime math                             |
-| `ui.ts`             | Dashboard HTML                                                   |
-| `auth.ts`           | Signed-cookie session auth                                       |
-| `rate-limit.ts`     | Per-IP request limiting for non-admins                           |
-| `read-memo.ts`      | Reuses chart/uptime reads until the next tick                    |
-| `push.ts`           | Web Push (RFC 8291 encryption + RFC 8292 VAPID), no dependencies |
-| `icons.ts`          | PWA icons                                                        |
-| `cost/`             | Cloudflare usage polling, pricing, thresholds                    |
+| File                 | Purpose                                                          |
+| -------------------- | ---------------------------------------------------------------- |
+| `worker.ts`          | Standalone entry — the only file that imports `config.ts`        |
+| `index.ts`           | The library: `createWorker()`, request + cron handlers, routing  |
+| `plan.ts`            | Free/paid plan profiles — every tunable and why                  |
+| `config.example.ts`  | What to monitor (copy to `config.ts`)                            |
+| `types.ts`           | Shared interfaces                                                |
+| `checks.ts`          | Check execution, concurrency pool, subrequest budgeting          |
+| `storage.ts`         | D1 + KV access, history, uptime math                             |
+| `ui.ts`              | Dashboard HTML                                                   |
+| `auth.ts`            | Signed-cookie session auth                                       |
+| `rate-limit.ts`      | Per-IP request limiting for non-admins                           |
+| `read-memo.ts`       | Reuses chart/uptime reads until the next tick                    |
+| `secret-services.ts` | Parses `SECRET_SERVICES`, adds them as services, scrubs errors   |
+| `socket-probe.ts`    | Direct HTTP/TCP check of a secret service over a raw socket      |
+| `push.ts`            | Web Push (RFC 8291 encryption + RFC 8292 VAPID), no dependencies |
+| `icons.ts`           | PWA icons                                                        |
+| `cost/`              | Cloudflare usage polling, pricing, thresholds                    |
 
 ## Development
 
