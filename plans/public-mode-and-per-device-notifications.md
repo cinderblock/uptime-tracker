@@ -1,7 +1,7 @@
 # Public mode, per-device notifications, and secret services
 
 **Plan path:** `plans/public-mode-and-per-device-notifications.md`
-**Status:** design. Not started. Waiting on the open questions below.
+**Status:** A and B built on branch `public-mode-notifications` (`11cfbb7`, `21c0803`), 99 tests passing. Next: test on the SVDSA test deployment (needs per-change yeses), then C.
 **Related:** `~/git/svdsa/stack/plans/uptime-to-chapter-account.md` covers the SVDSA
 deployment that motivates this work.
 
@@ -147,11 +147,39 @@ notify_recovery, urgency, updated_at)`, with primary key
 
 ## Progress log
 
-- [ ] A. Access tiers, with tests
-- [ ] B. Migration, API, dispatch, UI and budget cap, with tests. Check that ops
-      behaviour is unchanged
-- [ ] C. Secret services, plus the endpoint redaction audit, with tests
-- [ ] README updates for each
+- [x] A. Access tiers (`11cfbb7`). Public allowlist, admin login link, `/logout`, login
+      throttling in D1 (migration `0011`), and no stack traces for non-admins. 28 tests
+      cover it through the real worker handler.
+- [x] B. Per-device settings (`21c0803`):
+  - migration `0012`;
+  - the pure planner in `src/subscribers.ts`;
+  - the device API, keyed by endpoint in POST bodies;
+  - `SUBSCRIBE_PASSWORD` and `MAX_SUBSCRIPTIONS`;
+  - admin-only DDNS and cost alerts;
+  - a per-tick `pushBudget`.
+
+  End-to-end tests run the real `scheduled()` with real Web Push encryption and a
+  stubbed network: budget deferral, retry after a failed delivery, and removal of
+  expired subscriptions.
+
+- [x] README updated for both.
+- [ ] Deploy the branch to the SVDSA test deployment. Each step needs a yes:
+      bump the submodule, set `PUBLIC_DASHBOARD`, set the VAPID keys, and push to deploy.
+- [ ] Verify on real devices: subscribe, per-device bells, a real outage alert, the
+      subscribe code, and the admin login.
+- [ ] Merge the branch to `master`.
+- [ ] C. Secret services and the endpoint redaction audit, with tests.
+
+## Findings / gotchas
+
+- With per-device settings, the old global `notification_settings` table is unused.
+  Migration `0012` copies it and leaves it in place, so rolling back to the previous
+  release still works.
+- A device that predates `0012` keeps `default_enabled = 0` ("no row means off").
+  New devices get `1`: every service on, with recovery notices. GitHub workflows
+  stay opt-in.
+- Bash heredocs in this environment choke on large quoted Python bodies. Write the
+  edit script to a file, or use small Edit calls.
 
 ## Things not to do
 
