@@ -135,15 +135,21 @@ notify_recovery, urgency, updated_at)`, with primary key
 - Per-device settings are wanted **before** the SVDSA launch enables push
   notifications. Asked 2026-10-26.
 - Secret services are wanted. They aren't urgent and come after A and B.
+- Build upstream in this repo on a branch, and test on the SVDSA test deployment
+  (ops.isozilla.com doesn't run the engine yet). Decided 2026-10-26.
+- `MAX_SUBSCRIPTIONS` defaults to 100.
 
 ## Open questions
 
-1. **Where to build.** I recommend this upstream repo. All three features are
-   generic, the ops deployment benefits too, and the chapter's GitLab copy is cut
-   from it afterwards. The alternative is building them only in the chapter fork.
+1. **Webhook alerts (asked 2026-10-26, not designed or built).** The engine has no
+   webhook output of any kind; Web Push is the only alert channel. Worker
+   exceptions only reach Cloudflare's logs. Proposed: an `ALERT_WEBHOOK_URL`
+   secret (Discord/Slack-compatible JSON), per-event-type toggles including
+   check errors and Worker exceptions, sharing the per-tick push budget.
+   Needs: the destination, and which events.
 2. **Who should see secret services?** I recommend admins only. The alternative is
    showing a redacted placeholder ("Private service: up") to the public.
-3. **Default `MAX_SUBSCRIPTIONS`.** I suggest 100.
+
 
 ## Progress log
 
