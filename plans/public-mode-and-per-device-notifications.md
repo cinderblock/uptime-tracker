@@ -182,9 +182,12 @@ notify_recovery, urgency, updated_at)`, with primary key
     non-admins and failing open;
   - README "Traffic and cost";
   - `test/traffic.test.ts` counts D1 queries at the shim.
-- [ ] D on the SVDSA test deployment: add `[[ratelimits]]` to its `wrangler.toml`.
-      The deploy will show whether Workers Free accepts the binding.
-- [ ] D ported to ops (`ops/cloudflare/workers/uptime`). Staged; deploying needs a yes.
+- [x] Deployed A, B and D to the SVDSA test deployment (svdsa-uptime `1efa1b1`).
+      Workers Free accepts the rate-limit binding. Push stays inactive until
+      `VAPID_PRIVATE_KEY` is set (blocked on Cameron's wrangler login).
+- [x] D ported to ops (`ops/cloudflare/workers/uptime`) on ops branch
+      `uptime-read-memo-rate-limit` (`9b31c12`). Its tests and hooks pass.
+      **Merging to master deploys, so it needs a yes.**
 - [ ] Deploy the branch to the SVDSA test deployment. Each step needs a yes:
       bump the submodule, set `PUBLIC_DASHBOARD`, set the VAPID keys, and push to deploy.
 - [ ] Verify on real devices: subscribe, per-device bells, a real outage alert, the
@@ -200,8 +203,9 @@ notify_recovery, urgency, updated_at)`, with primary key
 - A device that predates `0012` keeps `default_enabled = 0` ("no row means off").
   New devices get `1`: every service on, with recovery notices. GitHub workflows
   stay opt-in.
-- **Whether the rate-limit binding is available on Workers Free is undocumented**
-  (checked 2026-10-26). Neither the binding page nor the pricing page mentions plans.
+- **The rate-limit binding works on Workers Free.** The docs don't say so (neither
+  the binding page nor the pricing page mentions plans), but the SVDSA test deploy
+  on 2026-10-26 accepted it and returned 429s.
   Its limits count per location and approximately. `period` must be 10 or 60.
 - `caches.default` does nothing on `workers.dev`, which is why the memo is in-isolate
   rather than built on the Cache API.
