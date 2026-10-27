@@ -1,7 +1,7 @@
 # Public mode, per-device notifications, and secret services
 
 **Plan path:** `plans/public-mode-and-per-device-notifications.md`
-**Status:** A and B built on branch `public-mode-notifications` (`11cfbb7`, `21c0803`), 99 tests passing. Next: test on the SVDSA test deployment (needs per-change yeses), then C.
+**Status:** A, B and D built on branch `public-mode-notifications`, 106 tests passing. Next: deploy to the SVDSA test deployment (approved; blocked on Cameron's wrangler login), then port D to ops, then C and E.
 **Related:** `~/git/svdsa/stack/plans/uptime-to-chapter-account.md` covers the SVDSA
 deployment that motivates this work.
 
@@ -16,6 +16,10 @@ Make a public status page that people can subscribe to safely:
 - **C. Secret services.** Hosts that are monitored but never published in the repo
   or shown to public viewers (for example, an origin server hidden behind the
   Cloudflare proxy).
+- **D. Traffic and cost hardening.** A public page mustn't let a stranger exhaust the
+  account's daily limits or run up a bill. Added after Cameron asked, 2026-10-26.
+- **E. Webhook alerts.** Every event, with metadata, posted to Slack (directly or via
+  the chapter's bot on Helena).
 
 A is a prerequisite for both B and C. Build in that order.
 
@@ -138,18 +142,21 @@ notify_recovery, urgency, updated_at)`, with primary key
 - Build upstream in this repo on a branch, and test on the SVDSA test deployment
   (ops.isozilla.com doesn't run the engine yet). Decided 2026-10-26.
 - `MAX_SUBSCRIPTIONS` defaults to 100.
+- D is wanted here **and on Cameron's ops deployment** ("do it. on my OPS as well",
+  2026-10-26). Ops still runs its own copy, so D gets ported there separately.
+- Webhooks: send every event type, with metadata so the receiver can filter. Slack is
+  the destination, either directly or through the chapter's bot on Helena (Slack
+  limits how many bots a workspace can have).
 
 ## Open questions
 
-1. **Webhook alerts (asked 2026-10-26, not designed or built).** The engine has no
-   webhook output of any kind; Web Push is the only alert channel. Worker
-   exceptions only reach Cloudflare's logs. Proposed: an `ALERT_WEBHOOK_URL`
-   secret (Discord/Slack-compatible JSON), per-event-type toggles including
-   check errors and Worker exceptions, sharing the per-tick push budget.
-   Needs: the destination, and which events.
+1. **Webhook transport.** Can the Helena bot take an HTTP POST? I recommend a
+   generic JSON event with an HMAC signature header sent to the bot, since that
+   uses no Slack app slot. Slack's incoming-webhook format would be an option for
+   posting direct. Today Web Push is the only alert channel, and Worker
+   exceptions only reach Cloudflare's logs.
 2. **Who should see secret services?** I recommend admins only. The alternative is
    showing a redacted placeholder ("Private service: up") to the public.
-
 
 ## Progress log
 
@@ -169,6 +176,15 @@ notify_recovery, urgency, updated_at)`, with primary key
   expired subscriptions.
 
 - [x] README updated for both.
+- [x] D. Traffic hardening (this branch):
+  - `src/read-memo.ts` reuses chart and uptime reads until `lastUpdate` changes;
+  - `src/rate-limit.ts` adds an optional `RATE_LIMITER` binding, applied per IP to
+    non-admins and failing open;
+  - README "Traffic and cost";
+  - `test/traffic.test.ts` counts D1 queries at the shim.
+- [ ] D on the SVDSA test deployment: add `[[ratelimits]]` to its `wrangler.toml`.
+      The deploy will show whether Workers Free accepts the binding.
+- [ ] D ported to ops (`ops/cloudflare/workers/uptime`). Staged; deploying needs a yes.
 - [ ] Deploy the branch to the SVDSA test deployment. Each step needs a yes:
       bump the submodule, set `PUBLIC_DASHBOARD`, set the VAPID keys, and push to deploy.
 - [ ] Verify on real devices: subscribe, per-device bells, a real outage alert, the
@@ -184,6 +200,13 @@ notify_recovery, urgency, updated_at)`, with primary key
 - A device that predates `0012` keeps `default_enabled = 0` ("no row means off").
   New devices get `1`: every service on, with recovery notices. GitHub workflows
   stay opt-in.
+- **Whether the rate-limit binding is available on Workers Free is undocumented**
+  (checked 2026-10-26). Neither the binding page nor the pricing page mentions plans.
+  Its limits count per location and approximately. `period` must be 10 or 60.
+- `caches.default` does nothing on `workers.dev`, which is why the memo is in-isolate
+  rather than built on the Cache API.
+- Transitions are written _after_ the status blob in a tick, so they aren't memoized:
+  a view between the two writes would otherwise pin old transitions for a whole tick.
 - Bash heredocs in this environment choke on large quoted Python bodies. Write the
   edit script to a file, or use small Edit calls.
 
