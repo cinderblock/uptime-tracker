@@ -900,37 +900,6 @@ export interface StoredPushSubscription {
   last_notified: number | null;
 }
 
-/** Upsert a push subscription (insert or update keys for existing endpoint) */
-export async function addPushSubscription(
-  db: D1Database | undefined,
-  endpoint: string,
-  p256dh: string,
-  auth: string,
-): Promise<void> {
-  if (!db) return;
-  await db
-    .prepare(
-      `INSERT INTO push_subscriptions (endpoint, p256dh, auth, created_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth`,
-    )
-    .bind(endpoint, p256dh, auth, Date.now())
-    .run();
-}
-
-/** Remove a push subscription by endpoint */
-export async function removePushSubscription(db: D1Database | undefined, endpoint: string): Promise<void> {
-  if (!db) return;
-  await db.prepare(`DELETE FROM push_subscriptions WHERE endpoint = ?`).bind(endpoint).run();
-}
-
-/** Remove a push subscription by ID */
-export async function removePushSubscriptionById(db: D1Database | undefined, id: number): Promise<boolean> {
-  if (!db) return false;
-  const result = await db.prepare(`DELETE FROM push_subscriptions WHERE id = ?`).bind(id).run();
-  return (result.meta.changes ?? 0) > 0;
-}
-
 /** Retrieve all stored push subscriptions */
 export async function getAllPushSubscriptions(db: D1Database | undefined): Promise<StoredPushSubscription[]> {
   if (!db) return [];
@@ -953,95 +922,10 @@ export async function updateLastNotified(db: D1Database | undefined, endpoint: s
 // Notification Settings Storage
 // ============================================
 
-const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
-  enabled: 0,
-  failure_threshold: 1,
-  notify_recovery: 0,
-  urgency: null,
-};
-
 const DEFAULT_NOTIFICATION_STATE: NotificationState = {
   consecutive_down: 0,
   notified_down: 0,
 };
-
-/** Get notification settings for a key, returning defaults if not set */
-export async function getNotificationSettings(db: D1Database | undefined, key: string): Promise<NotificationSettings> {
-  if (!db) return { ...DEFAULT_NOTIFICATION_SETTINGS };
-
-  const row = await db
-    .prepare(
-      `SELECT enabled, failure_threshold, notify_recovery, urgency
-       FROM notification_settings WHERE key = ?`,
-    )
-    .bind(key)
-    .first<{
-      enabled: number;
-      failure_threshold: number;
-      notify_recovery: number;
-      urgency: string | null;
-    }>();
-
-  if (!row) return { ...DEFAULT_NOTIFICATION_SETTINGS };
-  return { ...row, urgency: row.urgency as NotificationSettings['urgency'] };
-}
-
-/** Upsert user-facing notification settings for a key; resets runtime state so no stale notification fires. */
-export async function setNotificationSettings(
-  db: D1Database | undefined,
-  key: string,
-  settings: NotificationSettings,
-): Promise<void> {
-  if (!db) return;
-  await db.batch([
-    db
-      .prepare(
-        `INSERT INTO notification_settings (key, enabled, failure_threshold, notify_recovery, urgency, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(key) DO UPDATE SET
-           enabled = excluded.enabled,
-           failure_threshold = excluded.failure_threshold,
-           notify_recovery = excluded.notify_recovery,
-           urgency = excluded.urgency,
-           updated_at = excluded.updated_at`,
-      )
-      .bind(key, settings.enabled, settings.failure_threshold, settings.notify_recovery, settings.urgency, Date.now()),
-    // Reset runtime state so a settings change never immediately triggers a notification
-    db
-      .prepare(
-        `INSERT INTO notification_state (key, consecutive_down, notified_down)
-         VALUES (?, 0, 0)
-         ON CONFLICT(key) DO UPDATE SET consecutive_down = 0, notified_down = 0`,
-      )
-      .bind(key),
-  ]);
-}
-
-/** Get all notification settings rows */
-export async function getAllNotificationSettings(
-  db: D1Database | undefined,
-): Promise<Record<string, NotificationSettings>> {
-  if (!db) return {};
-  const result = await db
-    .prepare(
-      `SELECT key, enabled, failure_threshold, notify_recovery, urgency
-       FROM notification_settings`,
-    )
-    .all<{
-      key: string;
-      enabled: number;
-      failure_threshold: number;
-      notify_recovery: number;
-      urgency: string | null;
-    }>();
-
-  const map: Record<string, NotificationSettings> = {};
-  for (const row of result.results) {
-    const { key, ...rest } = row;
-    map[key] = { ...rest, urgency: rest.urgency as NotificationSettings['urgency'] };
-  }
-  return map;
-}
 
 /** Get runtime notification state for a key */
 export async function getNotificationState(db: D1Database | undefined, key: string): Promise<NotificationState> {

@@ -87,7 +87,7 @@ export function renderDashboard(
   charts?: ChartData,
   cost?: CostPanelData,
   // Defaults to admin: callers that predate public mode keep the full view.
-  access: DashboardAccess = { admin: true, loginAvailable: false },
+  access: DashboardAccess = { admin: true, loginAvailable: false, subscribeCodeRequired: false },
 ): string {
   const panels = status?.panels ?? [];
   const lastUpdate = status?.lastUpdate;
@@ -488,6 +488,21 @@ export function renderDashboard(
       <div class="modal-actions">
         <button class="btn" id="confirm-cancel">Cancel</button>
         <button class="btn-danger" id="confirm-ok">Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="subscribe-code-modal">
+    <div class="modal">
+      <div class="modal-title">🔔 Subscribe to notifications</div>
+      <div class="notif-row" style="flex-direction:column;align-items:stretch;gap:0.5rem">
+        <label for="subscribe-code">Subscribe code</label>
+        <input type="password" id="subscribe-code" autocomplete="off" style="padding:0.4rem 0.5rem;background:var(--bg-body);border:1px solid var(--border);border-radius:0.25rem;color:var(--text);font-family:inherit">
+        <span id="subscribe-code-error" style="color:var(--color-down);font-size:0.75rem"></span>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="subscribe-code-cancel">Cancel</button>
+        <button class="btn" id="subscribe-code-ok" style="background:var(--color-up);color:#fff;border-color:var(--color-up)">Subscribe</button>
       </div>
     </div>
   </div>
@@ -1592,113 +1607,162 @@ export function renderDashboard(
     }, 5 * 60 * 1000);
 
     // Service Worker & Push Notifications
+    // Push notifications, per device. One service-worker registration is shared
+    // by the header button and the per-service bells. The push endpoint is what
+    // identifies this device to the server, so every settings call sends it.
     (function () {
-      if (!('serviceWorker' in navigator)) return;
       const vapidPublicKey = ${vapidPublicKey ? JSON.stringify(vapidPublicKey) : 'null'};
+      const SUBSCRIBE_CODE_REQUIRED = ${access.subscribeCodeRequired ? 'true' : 'false'};
+      if (!vapidPublicKey || !('serviceWorker' in navigator) || !('PushManager' in window)) return;
 
-      navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(function (reg) {
-        function updateNotifBtn() {
-          const btn = document.getElementById('notif-btn');
-          if (!btn || !('PushManager' in window)) return;
-          if (Notification.permission === 'denied') {
-            btn.textContent = '🔕';
-            btn.title = 'Notifications blocked — allow them in browser settings';
-            btn.dataset.state = 'denied';
-            return;
+      const notifBtn = document.getElementById('notif-btn');
+      const regPromise = navigator.serviceWorker.register('/sw.js', { scope: '/' });
+      regPromise.catch(function (err) {
+        console.warn('Service worker registration failed:', err);
+      });
+
+      async function currentSub() {
+        const reg = await regPromise;
+        return reg.pushManager.getSubscription();
+      }
+
+      function jsonPost(path, body) {
+        return fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      }
+
+      // ── Header button ──────────────────────────────────────────────────────
+      function setBtn(state) {
+        if (!notifBtn) return;
+        notifBtn.dataset.state = state;
+        if (state === 'on') {
+          notifBtn.textContent = '🔔';
+          notifBtn.title = 'Notifications on for this device — click to turn off';
+        } else if (state === 'denied') {
+          notifBtn.textContent = '🔕';
+          notifBtn.title = 'Notifications blocked — allow them in browser settings';
+        } else {
+          notifBtn.textContent = '🔕';
+          notifBtn.title = 'Click to get notifications on this device';
+        }
+      }
+
+      async function refreshBtn() {
+        if (Notification.permission === 'denied') return setBtn('denied');
+        setBtn((await currentSub()) ? 'on' : 'off');
+      }
+
+      // ── Subscribe-code dialog ──────────────────────────────────────────────
+      // Resolves with the code entered, or null if cancelled.
+      function askForCode(message) {
+        const codeModal = document.getElementById('subscribe-code-modal');
+        const input = document.getElementById('subscribe-code');
+        const ok = document.getElementById('subscribe-code-ok');
+        const cancel = document.getElementById('subscribe-code-cancel');
+        document.getElementById('subscribe-code-error').textContent = message || '';
+        input.value = '';
+        codeModal.classList.add('visible');
+        input.focus();
+        return new Promise(function (resolve) {
+          function done(value) {
+            codeModal.classList.remove('visible');
+            ok.removeEventListener('click', onOk);
+            cancel.removeEventListener('click', onCancel);
+            input.removeEventListener('keydown', onKey);
+            resolve(value);
           }
-          reg.pushManager.getSubscription().then(function (sub) {
-            if (sub) {
-              btn.textContent = '🔔';
-              btn.title = 'Notifications enabled — click to unsubscribe';
-              btn.dataset.state = 'on';
-            } else {
-              btn.textContent = '🔕';
-              btn.title = 'Click to enable push notifications';
-              btn.dataset.state = 'off';
-            }
-          });
+          function onOk() { done(input.value); }
+          function onCancel() { done(null); }
+          function onKey(e) {
+            if (e.key === 'Enter') onOk();
+            if (e.key === 'Escape') onCancel();
+          }
+          ok.addEventListener('click', onOk);
+          cancel.addEventListener('click', onCancel);
+          input.addEventListener('keydown', onKey);
+        });
+      }
+
+      // Subscribe this device. Resolves true once the server has it.
+      async function subscribe() {
+        const perm = await Notification.requestPermission();
+        if (perm !== 'granted') { await refreshBtn(); return false; }
+
+        let code = null;
+        if (SUBSCRIBE_CODE_REQUIRED) {
+          code = await askForCode('');
+          if (code === null) return false;
         }
 
-        if (vapidPublicKey) updateNotifBtn();
+        const reg = await regPromise;
+        const pad = '='.repeat((4 - vapidPublicKey.length % 4) % 4);
+        const b64 = (vapidPublicKey + pad).replace(/-/g, '+').replace(/_/g, '/');
+        const appKey = Uint8Array.from(atob(b64), function (c) { return c.charCodeAt(0); });
+        let sub;
+        try {
+          sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: appKey });
+        } catch (err) {
+          console.error('Push subscription failed:', err);
+          await refreshBtn();
+          return false;
+        }
 
-        const notifBtn = document.getElementById('notif-btn');
-        if (!notifBtn || !vapidPublicKey) return;
+        const j = sub.toJSON();
+        if (notifBtn) notifBtn.classList.add('notif-saving');
+        for (;;) {
+          let res = null;
+          try {
+            res = await jsonPost('/api/subscribe', { endpoint: j.endpoint, keys: j.keys, code: code });
+          } catch (err) {
+            console.error('Subscribe server save failed:', err);
+          }
+          if (res && res.ok) break;
+          // A wrong code asks again rather than making them start over.
+          if (res && res.status === 403 && SUBSCRIBE_CODE_REQUIRED) {
+            code = await askForCode('That code did not work. Try again.');
+            if (code !== null) continue;
+          } else if (res) {
+            const msg = (await res.json().catch(function () { return {}; })).error;
+            console.error('Server rejected subscription:', res.status, msg);
+            if (msg) alert(msg);
+          }
+          if (notifBtn) notifBtn.classList.remove('notif-saving');
+          await sub.unsubscribe();
+          await refreshBtn();
+          return false;
+        }
+        if (notifBtn) notifBtn.classList.remove('notif-saving');
+        setBtn('on');
+        await loadBellStates();
+        return true;
+      }
 
-        notifBtn.addEventListener('click', async function () {
+      async function unsubscribe() {
+        const sub = await currentSub();
+        setBtn('off');
+        allSettings = {};
+        document.querySelectorAll('.bell-btn').forEach(applyBellState);
+        if (!sub) return;
+        const endpoint = sub.endpoint;
+        await sub.unsubscribe();
+        jsonPost('/api/unsubscribe', { endpoint: endpoint }).catch(function (err) {
+          console.error('Unsubscribe server cleanup failed:', err);
+        });
+      }
+
+      if (notifBtn) {
+        refreshBtn();
+        notifBtn.addEventListener('click', function () {
           const state = notifBtn.dataset.state;
           if (state === 'denied') {
             alert('Notifications are blocked. Enable them in your browser / OS settings, then reload.');
             return;
           }
-          if (state === 'on') {
-            // Optimistic: update UI immediately with saving indicator
-            notifBtn.textContent = '🔕';
-            notifBtn.title = 'Click to enable push notifications';
-            notifBtn.dataset.state = 'off';
-            notifBtn.classList.add('notif-saving');
-            const sub = await reg.pushManager.getSubscription();
-            if (sub) {
-              const endpoint = sub.endpoint;
-              await sub.unsubscribe();
-              fetch('/api/unsubscribe', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ endpoint }),
-              }).then(() => {
-                notifBtn.classList.remove('notif-saving');
-              }).catch(err => {
-                notifBtn.classList.remove('notif-saving');
-                console.error('Unsubscribe server cleanup failed:', err);
-              });
-            } else {
-              notifBtn.classList.remove('notif-saving');
-            }
-            return;
-          }
-          // Request permission and subscribe
-          const perm = await Notification.requestPermission();
-          if (perm !== 'granted') { updateNotifBtn(); return; }
-          try {
-            // Convert base64url to Uint8Array for applicationServerKey
-            const p = '='.repeat((4 - vapidPublicKey.length % 4) % 4);
-            const b64 = (vapidPublicKey + p).replace(/-/g, '+').replace(/_/g, '/');
-            const appKey = Uint8Array.from(atob(b64), function (c) { return c.charCodeAt(0); });
-            const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: appKey });
-            // Optimistic: update UI before server round-trip
-            notifBtn.textContent = '🔔';
-            notifBtn.title = 'Notifications enabled — click to unsubscribe';
-            notifBtn.dataset.state = 'on';
-            notifBtn.classList.add('notif-saving');
-            const j = sub.toJSON();
-            fetch('/api/subscribe', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ endpoint: j.endpoint, keys: j.keys }),
-            }).then(res => {
-              notifBtn.classList.remove('notif-saving');
-              if (!res.ok) {
-                sub.unsubscribe();
-                updateNotifBtn();
-                console.error('Server rejected subscription:', res.status);
-              }
-            }).catch(err => {
-              notifBtn.classList.remove('notif-saving');
-              sub.unsubscribe();
-              updateNotifBtn();
-              console.error('Subscribe server save failed:', err);
-            });
-          } catch (err) {
-            console.error('Push subscription failed:', err);
-            updateNotifBtn();
-          }
+          if (state === 'on') unsubscribe();
+          else subscribe();
         });
-      }).catch(function (err) {
-        console.warn('Service worker registration failed:', err);
-      });
-    })();
+      }
 
-    // Notification settings modal
-    (function () {
+      // ── Per-service bells: this device's settings ──────────────────────────
       const modal = document.getElementById('notif-settings-modal');
       const titleEl = document.getElementById('notif-settings-title');
       const enabledEl = document.getElementById('notif-enabled');
@@ -1708,9 +1772,8 @@ export function renderDashboard(
       const cancelBtn = document.getElementById('notif-cancel');
       const saveBtn = document.getElementById('notif-save');
       let currentKey = null;
-      let allSettings = {}; // cached bulk settings
+      let allSettings = {}; // this device's effective settings, by key
 
-      // Update bell icon from cached settings
       function applyBellState(btn) {
         const key = btn.dataset.notifyKey;
         if (!key) return;
@@ -1726,26 +1789,31 @@ export function renderDashboard(
         }
       }
 
-      // Bulk-fetch all notification settings in one request, then update all bells
-      async function loadAllBellStates() {
-        try {
-          const res = await fetch('/api/notification-settings');
-          allSettings = await res.json();
-        } catch { allSettings = {}; }
+      // One request for every key. A device that isn't subscribed has no
+      // settings, so every bell shows off.
+      async function loadBellStates() {
+        allSettings = {};
+        const sub = await currentSub().catch(function () { return null; });
+        if (sub) {
+          try {
+            const res = await jsonPost('/api/notification-settings', { endpoint: sub.endpoint });
+            if (res.ok) allSettings = (await res.json()).settings || {};
+          } catch {}
+        }
         document.querySelectorAll('.bell-btn').forEach(applyBellState);
       }
 
-      // Initialize: single bulk fetch
-      loadAllBellStates();
+      loadBellStates();
 
-      // Attach click handlers to all bell buttons
-      document.querySelectorAll('.bell-btn').forEach(btn => {
-        btn.addEventListener('click', function (e) {
+      document.querySelectorAll('.bell-btn').forEach(function (btn) {
+        btn.addEventListener('click', async function (e) {
           e.stopPropagation();
+          // Settings belong to a device, so a bell on an unsubscribed device
+          // subscribes it first.
+          if (!(await currentSub()) && !(await subscribe())) return;
           currentKey = btn.dataset.notifyKey;
           const label = btn.dataset.notifyLabel || currentKey;
           if (titleEl) titleEl.textContent = '🔔 Notifications: ' + label;
-          // Populate modal from cached settings
           const s = allSettings[currentKey] || {};
           if (enabledEl) enabledEl.checked = !!s.enabled;
           if (thresholdEl) thresholdEl.value = String(s.failure_threshold || 1);
@@ -1764,11 +1832,14 @@ export function renderDashboard(
       }
 
       cancelBtn.addEventListener('click', hideModal);
-      modal.addEventListener('click', (e) => { if (e.target === modal) hideModal(); });
+      modal.addEventListener('click', function (e) { if (e.target === modal) hideModal(); });
 
-      saveBtn.addEventListener('click', function () {
+      saveBtn.addEventListener('click', async function () {
         if (!currentKey) return;
+        const sub = await currentSub();
+        if (!sub) { hideModal(); return; }
         const body = {
+          endpoint: sub.endpoint,
           key: currentKey,
           enabled: enabledEl.checked ? 1 : 0,
           failure_threshold: Math.max(1, parseInt(thresholdEl.value) || 1),
@@ -1780,21 +1851,16 @@ export function renderDashboard(
         const prevSettings = allSettings[savedKey];
         allSettings[savedKey] = { enabled: body.enabled, failure_threshold: body.failure_threshold, notify_recovery: body.notify_recovery, urgency: body.urgency };
         const affectedBells = document.querySelectorAll('.bell-btn[data-notify-key="' + CSS.escape(savedKey) + '"]');
-        affectedBells.forEach(b => { applyBellState(b); b.classList.add('notif-saving'); });
+        affectedBells.forEach(function (b) { applyBellState(b); b.classList.add('notif-saving'); });
         hideModal();
         // Fire-and-forget with rollback on failure
-        fetch('/api/notification-settings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        }).then(res => {
+        jsonPost('/api/notification-settings', body).then(function (res) {
           if (!res.ok) throw new Error('Server returned ' + res.status);
-          affectedBells.forEach(b => b.classList.remove('notif-saving'));
-        }).catch(err => {
+          affectedBells.forEach(function (b) { b.classList.remove('notif-saving'); });
+        }).catch(function (err) {
           console.error('Failed to save notification settings:', err);
-          // Rollback
           if (prevSettings) { allSettings[savedKey] = prevSettings; } else { delete allSettings[savedKey]; }
-          affectedBells.forEach(b => { applyBellState(b); b.classList.remove('notif-saving'); });
+          affectedBells.forEach(function (b) { applyBellState(b); b.classList.remove('notif-saving'); });
         });
       });
     })();

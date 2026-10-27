@@ -69,6 +69,19 @@ export async function verifyPassword(env: Env, submitted: string): Promise<boole
   return timingSafeEqual(new Uint8Array(a), new Uint8Array(b));
 }
 
+/** Does `submitted` match SUBSCRIBE_PASSWORD? True when no code is set:
+ *  then anyone who can see the dashboard may subscribe. */
+export async function verifySubscribeCode(env: Env, submitted: string | undefined): Promise<boolean> {
+  const expected = env.SUBSCRIBE_PASSWORD;
+  if (!expected) return true;
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(submitted ?? '')),
+    crypto.subtle.digest('SHA-256', enc.encode(expected)),
+  ]);
+  return timingSafeEqual(new Uint8Array(a), new Uint8Array(b));
+}
+
 /** Mint a signed session token. */
 export async function issueToken(env: Env, now: number = Date.now()): Promise<string> {
   assertAuthConfig(env);
@@ -154,7 +167,16 @@ export function isPublicMode(env: Env): boolean {
 /** Read-only paths a public-mode visitor may reach without logging in.
  *  Everything here must be safe to serve to anyone: handlers check `admin`
  *  and strip DDNS, cost and other admin-only data from the response. */
-const PUBLIC_MODE_PATHS = new Set(['/', '/api/poll']);
+const PUBLIC_MODE_PATHS = new Set([
+  '/',
+  '/api/poll',
+  // A device managing its own push subscription. Each handler authorises by
+  // the device's endpoint (and, to subscribe, SUBSCRIBE_PASSWORD), and only
+  // ever touches that one device. See subscribers.ts.
+  '/api/subscribe',
+  '/api/unsubscribe',
+  '/api/notification-settings',
+]);
 
 /** GET-only additions: the same path also has an admin-only write method. */
 const PUBLIC_MODE_GET_PATHS = new Set(['/api/history']);

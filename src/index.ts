@@ -27,6 +27,7 @@ import {
   loginRetryAfter,
   recordLoginFailure,
   verifyPassword,
+  verifySubscribeCode,
   verifyUsageToken,
 } from './auth';
 import { runAllChecks, runBudgetedChecks, parseConcurrency } from './checks';
@@ -49,14 +50,8 @@ import {
   getRecentErrors,
   getLastCheckedTimes,
   deleteServiceHistory,
-  addPushSubscription,
-  removePushSubscription,
-  removePushSubscriptionById,
   getAllPushSubscriptions,
   updateLastNotified,
-  getNotificationSettings,
-  setNotificationSettings,
-  getAllNotificationSettings,
   getAllNotificationStates,
   getNotificationState,
   updateNotificationState,
@@ -68,6 +63,23 @@ import {
 } from './storage';
 import { cleanupRollup, rollUpHourly } from './storage-free';
 import { renderDashboard } from './ui';
+import {
+  applyNotifiedChanges,
+  countSubscribers,
+  deleteSubscriber,
+  deleteSubscriberByEndpoint,
+  effectiveSettings,
+  getSubscriberByEndpoint,
+  getSubscriberSettings,
+  isAdminOnlyKey,
+  loadDispatchView,
+  planServiceNotifications,
+  setSubscriberSetting,
+  upsertSubscriber,
+  type DispatchView,
+  type ServiceObservation,
+  type Subscriber,
+} from './subscribers';
 import { sendPushNotification } from './push';
 import { ICON_180_PNG, ICON_192_PNG, ICON_512_PNG } from './icons';
 import { mergePricing } from './cost/pricing';
@@ -374,7 +386,11 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
         return new Response('Not Found', { status: 404 });
       }
       // Offer an Admin link (public mode) or Log out only where a password exists.
-      const access: DashboardAccess = { admin, loginAvailable: isAuthEnabled(env) };
+      const access: DashboardAccess = {
+        admin,
+        loginAvailable: isAuthEnabled(env),
+        subscribeCodeRequired: !admin && Boolean(env.SUBSCRIBE_PASSWORD),
+      };
 
       try {
         switch (url.pathname) {
@@ -438,13 +454,13 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
             return handleApiDdnsLog(url, env, plan);
 
           case '/api/subscribe':
-            return handleApiSubscribe(request, env);
+            return handleApiSubscribe(request, env, admin);
 
           case '/api/unsubscribe':
             return handleApiUnsubscribe(request, env);
 
           case '/api/notification-settings':
-            return handleApiNotificationSettings(request, env);
+            return handleApiNotificationSettings(request, env, config, ddnsClients);
 
           case '/api/subscriptions':
             return handleApiSubscriptions(request, env);
@@ -529,17 +545,17 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
         // `cached` doubles as (1) input to the retry-on-timeout map (so a glitch
         // after a prior 'up' triggers one retry) and (2) the merge baseline for
         // services we don't have budget to recheck this tick.
-        const [lastCheckedTimes, allNotifSettings, cached] = await Promise.all([
+        const [lastCheckedTimes, dispatchView, cached] = await Promise.all([
           getLastCheckedTimes(plan, env.KV, env.DB),
-          getAllNotificationSettings(env.DB),
+          loadDispatchView(env.DB),
           getCurrentStatus(plan, env.KV, env.DB),
         ]);
 
-        // Services with notifications enabled get checked first
+        // Services some device wants notifications for get checked first
         const priorityKeys = new Set(
-          Object.entries(allNotifSettings)
-            .filter(([, s]) => s.enabled)
-            .map(([key]) => key),
+          config.panels
+            .flatMap(p => p.services.map(s => (Array.isArray(s.host) ? s.host[0] : s.host)))
+            .filter(key => recipientsFor(dispatchView, key).length > 0),
         );
 
         // URL → most recent CheckResult, threaded through runBudgetedChecks so
@@ -609,17 +625,21 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
         // a 200-row D1 query.
         ctx.waitUntil(refreshDdnsCache(plan, env.KV, env.DB, ddnsCacheTtlSeconds(plan)));
 
+        // One push budget for the whole tick, shared by every sender below. They
+        // run concurrently, but each takes its slot synchronously before sending.
+        const pushBudget: PushBudget = { remaining: plan.pushBudget };
+
         // Detect services that newly transitioned to 'down' and send push notifications
-        ctx.waitUntil(sendDowntimeNotifications(panels, env));
+        ctx.waitUntil(sendDowntimeNotifications(panels, env, dispatchView, pushBudget));
 
         // Detect DDNS staleness (heartbeat clients) and send push notifications
-        ctx.waitUntil(sendDdnsFailureNotifications(ddnsClients, env));
+        ctx.waitUntil(sendDdnsFailureNotifications(ddnsClients, env, dispatchView, pushBudget));
 
         // Notify on actual DDNS IP changes (any client)
-        ctx.waitUntil(sendDdnsIpChangeNotifications(env));
+        ctx.waitUntil(sendDdnsIpChangeNotifications(env, dispatchView, pushBudget));
 
         // Detect GitHub build failures and send push notifications
-        ctx.waitUntil(sendBuildFailureNotifications(config, env));
+        ctx.waitUntil(sendBuildFailureNotifications(config, env, dispatchView, pushBudget));
 
         // Record state flips for the correlation timeline (services + GitHub + DDNS).
         // Wrapped so a GitHub API hiccup can't fail the scheduled handler.
@@ -641,7 +661,7 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
         // Threshold checks cost 2 KV reads + 5 D1 SUMs. Cheap on paid (every
         // tick); rate-limited on free, where those reads are metered.
         if (isNthTick(minuteOfDay, plan, plan.costCheckEveryTicks)) {
-          ctx.waitUntil(checkAndFireThresholdAlerts(env));
+          ctx.waitUntil(checkAndFireThresholdAlerts(env, pushBudget));
         }
 
         // Clean up old entries periodically. Deletes count as D1 rows written,
@@ -677,36 +697,92 @@ export function createWorker({ config, ddnsClients = [] }: WorkerOptions): Expor
   };
 }
 
-/** Send push notifications to all subscribers, removing expired ones.
- *  Returns delivery result with subscriber count and whether any were delivered. */
-async function sendNotifications(
+/** Push deliveries allowed this tick, shared by every notification type. One
+ *  push is one subrequest, and the free plan allows 50 per invocation. */
+interface PushBudget {
+  remaining: number;
+}
+
+type DeliveryOutcome = 'delivered' | 'failed' | 'gone' | 'deferred';
+
+/** Send one push to one device. Expired subscriptions (404/410) are removed.
+ *  'deferred' means the tick's budget ran out and nothing was sent. */
+async function sendToSubscriber(
   db: Env['DB'],
   vapid: { publicKey: string; privateKey: string; subject: string },
+  sub: Subscriber,
   data: Record<string, unknown>,
-  options?: NotificationDisplayOptions,
-): Promise<{ delivered: boolean; subscriberCount: number }> {
-  const subscriptions = await getAllPushSubscriptions(db);
-  if (subscriptions.length === 0) return { delivered: false, subscriberCount: 0 };
+  options: NotificationDisplayOptions,
+  budget: PushBudget,
+): Promise<DeliveryOutcome> {
+  if (budget.remaining <= 0) return 'deferred';
+  budget.remaining--;
 
   // Merge display options into payload for the service worker
-  const payload = options ? { ...data, silent: options.silent, requireInteraction: options.requireInteraction } : data;
-
-  let anyDelivered = false;
-  for (const sub of subscriptions) {
-    const result = await sendPushNotification(sub.endpoint, sub.p256dh, sub.auth, payload, vapid, options?.urgency);
-    if (result.ok) {
-      anyDelivered = true;
-      await updateLastNotified(db, sub.endpoint);
-    } else {
-      const truncated = sub.endpoint.slice(0, 60) + '…';
-      console.error(`Push failed for ${truncated}: status=${result.status} error=${result.error}`);
-      if (result.status === 404 || result.status === 410) {
-        await removePushSubscription(db, sub.endpoint);
-        console.log(`Removed expired push subscription: ${truncated}`);
-      }
-    }
+  const payload = { ...data, silent: options.silent, requireInteraction: options.requireInteraction };
+  const result = await sendPushNotification(sub.endpoint, sub.p256dh, sub.auth, payload, vapid, options.urgency);
+  if (result.ok) {
+    await updateLastNotified(db, sub.endpoint);
+    return 'delivered';
   }
-  return { delivered: anyDelivered, subscriberCount: subscriptions.length };
+  const truncated = sub.endpoint.slice(0, 60) + '…';
+  console.error(`Push failed for ${truncated}: status=${result.status} error=${result.error}`);
+  if (result.status === 404 || result.status === 410) {
+    await deleteSubscriber(db, sub.id);
+    console.log(`Removed expired push subscription: ${truncated}`);
+    return 'gone';
+  }
+  return 'failed';
+}
+
+/** Devices that want `key`, with the settings that apply to each. */
+function recipientsFor(view: DispatchView, key: string): { sub: Subscriber; settings: NotificationSettings }[] {
+  return view.subscribers
+    .map(sub => ({ sub, settings: effectiveSettings(sub, view.settings.get(sub.id), key) }))
+    .filter(r => r.settings.enabled);
+}
+
+/** Send a one-shot event (DDNS, build, cost) to each recipient at its own
+ *  urgency, and log one entry for the event. Recipients past the tick's budget
+ *  miss it, so say so in the log. */
+async function sendEvent(
+  env: Env,
+  vapid: { publicKey: string; privateKey: string; subject: string },
+  recipients: { sub: Subscriber; urgency: PushUrgency | null }[],
+  event: { key: string; type: NotificationEventType; title: string; body: string; tag: string; url: string },
+  budget: PushBudget,
+  fixedOptions?: NotificationDisplayOptions,
+): Promise<{ delivered: boolean }> {
+  let delivered = 0;
+  let deferred = 0;
+  let lastOptions: NotificationDisplayOptions | null = null;
+  for (const { sub, urgency } of recipients) {
+    const options = fixedOptions ?? resolveNotificationOptions(event.type, urgency);
+    lastOptions = options;
+    const outcome = await sendToSubscriber(
+      env.DB,
+      vapid,
+      sub,
+      { title: event.title, body: event.body, tag: event.tag, url: event.url },
+      options,
+      budget,
+    );
+    if (outcome === 'delivered') delivered++;
+    if (outcome === 'deferred') deferred++;
+  }
+  if (deferred > 0) {
+    console.warn(`Push budget exhausted: ${deferred} device(s) missed "${event.title}"`);
+  }
+  await addNotificationLogEntry(env.DB, {
+    key: event.key,
+    type: event.type,
+    title: event.title,
+    body: event.body,
+    urgency: (lastOptions ?? URGENCY_DEFAULTS[event.type]).urgency,
+    subscribersNotified: recipients.length - deferred,
+    delivered: delivered > 0,
+  });
+  return { delivered: delivered > 0 };
 }
 
 /** Get VAPID config from env, or return null with a warning if incomplete. */
@@ -761,140 +837,109 @@ function resolveNotificationOptions(
   };
 }
 
-/** Pick the highest urgency override among a set of notification keys */
-function maxUrgencyOf(
-  keys: string[],
-  allSettings: Record<string, { urgency?: PushUrgency | null }>,
-): PushUrgency | null {
-  let max: PushUrgency | null = null;
-  for (const key of keys) {
-    const u = allSettings[key]?.urgency;
-    if (!u) continue;
-    if (!max || URGENCY_LEVELS.indexOf(u) > URGENCY_LEVELS.indexOf(max)) max = u;
-  }
-  return max;
-}
-
-/** Detect service up/down transitions and send push notifications respecting per-service settings. */
-async function sendDowntimeNotifications(newPanels: PanelStatus[], env: Env): Promise<void> {
-  const vapid = getVapid(env);
-  if (!vapid) return;
-
-  // Load all notification settings and states once
-  const allSettings = await getAllNotificationSettings(env.DB);
+/** Track each service's consecutive failures, then tell each device about the
+ *  outages and recoveries its own settings ask for. One combined push per
+ *  device per kind, so a wide outage is one notification, not one per service. */
+async function sendDowntimeNotifications(
+  newPanels: PanelStatus[],
+  env: Env,
+  view: DispatchView,
+  budget: PushBudget,
+): Promise<void> {
+  // The failure count is a fact about the service, so it's kept whether or not
+  // anyone is listening, and thresholds are right the moment someone enables one.
   const allStates = await getAllNotificationStates(env.DB);
-
-  const newlyDown: { name: string; key: string }[] = []; // services that just crossed their threshold
-  const alreadyDown: string[] = []; // services previously notified and still down
-  const recovered: { name: string; key: string }[] = [];
+  const observations: ServiceObservation[] = [];
   const stateUpdates: { key: string; consecutiveDown: number; notifiedDown: number }[] = [];
-
   for (const panel of newPanels) {
     for (const svc of panel.services) {
       if (svc.knownStatus === 'known-down') continue;
       const key = svc.host ?? svc.name;
-      const settings = allSettings[key] ?? { enabled: 0, failure_threshold: 1, notify_recovery: 0, urgency: null };
-      const state = allStates[key] ?? { consecutive_down: 0, notified_down: 0 };
-
-      if (!settings.enabled) {
-        // Still update state so thresholds stay accurate when re-enabled
-        if (svc.status === 'down') {
-          stateUpdates.push({ key, consecutiveDown: state.consecutive_down + 1, notifiedDown: state.notified_down });
-        } else if (state.consecutive_down > 0) {
-          stateUpdates.push({ key, consecutiveDown: 0, notifiedDown: 0 });
-        }
-        continue;
+      const prev = allStates[key]?.consecutive_down ?? 0;
+      const down = svc.status === 'down';
+      const count = down ? prev + 1 : 0;
+      if (count !== prev || allStates[key]?.notified_down) {
+        stateUpdates.push({ key, consecutiveDown: count, notifiedDown: 0 });
       }
-
-      if (svc.status === 'down') {
-        const newCount = state.consecutive_down + 1;
-        if (newCount >= settings.failure_threshold && !state.notified_down) {
-          newlyDown.push({ name: svc.name, key });
-          // Don't set notified_down yet — wait until delivery succeeds
-          stateUpdates.push({ key, consecutiveDown: newCount, notifiedDown: 0 });
-        } else {
-          if (state.notified_down) alreadyDown.push(svc.name);
-          stateUpdates.push({ key, consecutiveDown: newCount, notifiedDown: state.notified_down });
-        }
-      } else {
-        // Service is up
-        if (state.notified_down && settings.notify_recovery) {
-          recovered.push({ name: svc.name, key });
-        }
-        if (state.consecutive_down > 0 || state.notified_down) {
-          stateUpdates.push({ key, consecutiveDown: 0, notifiedDown: 0 });
-        }
-      }
+      observations.push({ key, name: svc.name, down, consecutiveDown: count });
     }
   }
-
-  // Batch-write all state changes in a single transaction
   await batchUpdateNotificationStates(env.DB, stateUpdates);
 
-  if (newlyDown.length > 0) {
-    // Include all currently-down services in the body so the notification
-    // (which replaces any previous one via the fixed tag) stays complete.
-    const allDownNames = [...newlyDown.map(s => s.name), ...alreadyDown];
-    const title = allDownNames.length === 1 ? '🔴 Service Down' : `🔴 ${allDownNames.length} Services Down`;
-    const body = allDownNames.join(', ');
-    // Use highest urgency among newly-down services
-    const options = resolveNotificationOptions(
-      'service-down',
-      maxUrgencyOf(
-        newlyDown.map(s => s.key),
-        allSettings,
-      ),
-    );
-    console.log(`Sending downtime notifications (urgency=${options.urgency}): ${body}`);
-    const result = await sendNotifications(env.DB, vapid, { title, body, tag: 'service-down', url: '/' }, options);
-    // Log one entry per service that triggered this notification
-    for (const s of newlyDown) {
-      await addNotificationLogEntry(env.DB, {
-        key: s.key,
-        type: 'service-down',
-        title,
-        body,
-        urgency: options.urgency,
-        subscribersNotified: result.subscriberCount,
-        delivered: result.delivered,
-      });
-    }
-    if (result.delivered) {
-      // Mark notified_down only after successful delivery
-      await batchUpdateNotificationStates(
+  const vapid = getVapid(env);
+  if (!vapid) return;
+
+  const plans = planServiceNotifications(observations, view.subscribers, view.settings, view.notified);
+  const setNotified: { id: number; key: string }[] = [];
+  const clearNotified: { id: number; key: string }[] = [];
+  // Per service and kind: how many devices were sent it, and whether any got it.
+  const log = new Map<string, { key: string; type: 'service-down' | 'service-recovery'; sent: number; ok: boolean }>();
+  const tally = (key: string, type: 'service-down' | 'service-recovery', outcome: DeliveryOutcome) => {
+    if (outcome === 'deferred') return;
+    const id = `${type}|${key}`;
+    const entry = log.get(id) ?? { key, type, sent: 0, ok: false };
+    entry.sent++;
+    entry.ok ||= outcome === 'delivered';
+    log.set(id, entry);
+  };
+
+  for (const p of plans) {
+    if (p.newlyDown.length > 0) {
+      // List everything down for this device so the notification, which
+      // replaces any previous one via the fixed tag, stays complete.
+      const names = [...p.newlyDown.map(s => s.name), ...p.alreadyDown];
+      const title = names.length === 1 ? '🔴 Service Down' : `🔴 ${names.length} Services Down`;
+      const options = resolveNotificationOptions('service-down', p.downUrgency);
+      const outcome = await sendToSubscriber(
         env.DB,
-        newlyDown.map(s => ({
-          key: s.key,
-          consecutiveDown: (allStates[s.key]?.consecutive_down ?? 0) + 1,
-          notifiedDown: 1,
-        })),
+        vapid,
+        p.sub,
+        { title, body: names.join(', '), tag: 'service-down', url: '/' },
+        options,
+        budget,
       );
+      for (const s of p.newlyDown) tally(s.key, 'service-down', outcome);
+      // Only a delivered notice counts as told. A failure or a deferral is
+      // retried next tick, since the device is still not marked.
+      if (outcome === 'delivered') for (const s of p.newlyDown) setNotified.push({ id: p.sub.id, key: s.key });
+    }
+
+    let recoveryOutcome: DeliveryOutcome | null = null;
+    if (p.recovered.length > 0) {
+      const names = p.recovered.map(s => s.name);
+      const title = names.length === 1 ? '🟢 Service Recovered' : `🟢 ${names.length} Services Recovered`;
+      const options = resolveNotificationOptions('service-recovery', p.recoveryUrgency);
+      recoveryOutcome = await sendToSubscriber(
+        env.DB,
+        vapid,
+        p.sub,
+        { title, body: names.join(', '), tag: 'service-recovery', url: '/' },
+        options,
+        budget,
+      );
+      for (const s of p.recovered) tally(s.key, 'service-recovery', recoveryOutcome);
+    }
+    // Keep the "told it was down" mark only if the recovery notice was deferred
+    // for budget, so it goes out next tick. Any other outcome closes the outage.
+    if (recoveryOutcome !== 'deferred') {
+      for (const key of p.cleared) clearNotified.push({ id: p.sub.id, key });
     }
   }
 
-  if (recovered.length > 0) {
-    const title = recovered.length === 1 ? '🟢 Service Recovered' : `🟢 ${recovered.length} Services Recovered`;
-    const body = recovered.map(s => s.name).join(', ');
-    const options = resolveNotificationOptions(
-      'service-recovery',
-      maxUrgencyOf(
-        recovered.map(s => s.key),
-        allSettings,
-      ),
-    );
-    console.log(`Sending recovery notifications (urgency=${options.urgency}): ${body}`);
-    const result = await sendNotifications(env.DB, vapid, { title, body, tag: 'service-recovery', url: '/' }, options);
-    for (const s of recovered) {
-      await addNotificationLogEntry(env.DB, {
-        key: s.key,
-        type: 'service-recovery',
-        title,
-        body,
-        urgency: options.urgency,
-        subscribersNotified: result.subscriberCount,
-        delivered: result.delivered,
-      });
-    }
+  await applyNotifiedChanges(env.DB, setNotified, clearNotified);
+
+  const names = new Map(observations.map(o => [o.key, o.name]));
+  for (const { key, type, sent, ok } of log.values()) {
+    const name = names.get(key) ?? key;
+    await addNotificationLogEntry(env.DB, {
+      key,
+      type,
+      title: type === 'service-down' ? '🔴 Service Down' : '🟢 Service Recovered',
+      body: name,
+      urgency: URGENCY_DEFAULTS[type].urgency,
+      subscribersNotified: sent,
+      delivered: ok,
+    });
   }
 }
 
@@ -906,15 +951,20 @@ const DDNS_STALE_MS = 60 * 60 * 1000;
 /** Watch each expected DDNS client for silence and send push notifications.
  *  The real failure signal is the *absence* of a recent success, not a
  *  scanner-driven 'rejected' row — so we alert on staleness of the last
- *  no_change/ip_change per hostname. User-facing settings are shared under the
- *  'ddns' key; runtime down/recovery state is tracked per hostname under
- *  `ddns:<hostname>`. */
-async function sendDdnsFailureNotifications(ddnsClients: DdnsClient[], env: Env): Promise<void> {
+ *  no_change/ip_change per hostname. Devices opt in under the shared 'ddns'
+ *  key (admin devices only, since alerts carry hostnames); runtime down/recovery
+ *  state is tracked per hostname under `ddns:<hostname>`. */
+async function sendDdnsFailureNotifications(
+  ddnsClients: DdnsClient[],
+  env: Env,
+  view: DispatchView,
+  budget: PushBudget,
+): Promise<void> {
   const vapid = getVapid(env);
   if (!vapid) return;
 
-  const settings = await getNotificationSettings(env.DB, 'ddns');
-  if (!settings.enabled) return;
+  const recipients = recipientsFor(view, 'ddns');
+  if (recipients.length === 0) return;
 
   const now = Date.now();
   for (const client of ddnsClients) {
@@ -923,7 +973,7 @@ async function sendDdnsFailureNotifications(ddnsClients: DdnsClient[], env: Env)
     // covered by sendDdnsIpChangeNotifications instead.
     if (!client.heartbeat) continue;
     try {
-      await checkDdnsClientHealth(env, vapid, settings, client, now);
+      await checkDdnsClientHealth(env, vapid, recipients, client, now, budget);
     } catch (err) {
       console.error(`DDNS health check failed for ${client.hostname}:`, err);
     }
@@ -937,12 +987,12 @@ async function sendDdnsFailureNotifications(ddnsClients: DdnsClient[], env: Env)
  *  notification_state.consecutive_down is repurposed as the last-notified
  *  ip_change id; migration 0008 seeds it past existing rows so we only alert on
  *  changes after deploy. */
-async function sendDdnsIpChangeNotifications(env: Env): Promise<void> {
+async function sendDdnsIpChangeNotifications(env: Env, view: DispatchView, budget: PushBudget): Promise<void> {
   const vapid = getVapid(env);
   if (!vapid) return;
 
-  const settings = await getNotificationSettings(env.DB, 'ddns');
-  if (!settings.enabled) return;
+  const recipients = recipientsFor(view, 'ddns');
+  if (recipients.length === 0) return;
 
   const KEY = 'ddns:ip-change';
   const state = await getNotificationState(env.DB, KEY);
@@ -951,25 +1001,15 @@ async function sendDdnsIpChangeNotifications(env: Env): Promise<void> {
   if (changes.length === 0) return;
 
   for (const ev of changes) {
-    const title = '🔁 DDNS IP Changed';
     const body = `${ev.hostname ?? 'unknown'}: ${ev.old_ip ?? '?'} → ${ev.new_ip ?? '?'}`;
-    const options = resolveNotificationOptions('ddns-ip-change', settings.urgency);
     console.log(`Sending DDNS ip-change notification: ${body}`);
-    const result = await sendNotifications(
-      env.DB,
+    await sendEvent(
+      env,
       vapid,
-      { title, body, tag: 'ddns-ip-change', url: '/ddns' },
-      options,
+      recipients.map(r => ({ sub: r.sub, urgency: r.settings.urgency })),
+      { key: KEY, type: 'ddns-ip-change', title: '🔁 DDNS IP Changed', body, tag: 'ddns-ip-change', url: '/ddns' },
+      budget,
     );
-    await addNotificationLogEntry(env.DB, {
-      key: KEY,
-      type: 'ddns-ip-change',
-      title,
-      body,
-      urgency: options.urgency,
-      subscribersNotified: result.subscriberCount,
-      delivered: result.delivered,
-    });
   }
 
   const maxId = changes.reduce((m, c) => Math.max(m, c.id), cursor);
@@ -979,9 +1019,10 @@ async function sendDdnsIpChangeNotifications(env: Env): Promise<void> {
 async function checkDdnsClientHealth(
   env: Env,
   vapid: { publicKey: string; privateKey: string; subject: string },
-  settings: NotificationSettings,
+  recipients: { sub: Subscriber; settings: NotificationSettings }[],
   client: DdnsClient,
   now: number,
+  budget: PushBudget,
 ): Promise<void> {
   const key = `ddns:${client.hostname}`;
   const state = await getNotificationState(env.DB, key);
@@ -991,41 +1032,38 @@ async function checkDdnsClientHealth(
   if (isStale) {
     if (state.notified_down) return; // already alerted for this outage
     const detail = lastSuccess ? `last checked in ${formatDuration(now - lastSuccess)} ago` : 'has never checked in';
-    const title = '⚠️ DDNS Stale';
     const body = `${client.label} (${client.hostname}) ${detail}`;
-    const options = resolveNotificationOptions('ddns-failure', settings.urgency);
-    console.log(`Sending DDNS stale notification (urgency=${options.urgency}): ${client.hostname} ${detail}`);
-    const result = await sendNotifications(env.DB, vapid, { title, body, tag: key, url: '/ddns' }, options);
-    await addNotificationLogEntry(env.DB, {
-      key,
-      type: 'ddns-failure',
-      title,
-      body,
-      urgency: options.urgency,
-      subscribersNotified: result.subscriberCount,
-      delivered: result.delivered,
-    });
+    console.log(`Sending DDNS stale notification: ${client.hostname} ${detail}`);
+    const result = await sendEvent(
+      env,
+      vapid,
+      recipients.map(r => ({ sub: r.sub, urgency: r.settings.urgency })),
+      { key, type: 'ddns-failure', title: '⚠️ DDNS Stale', body, tag: key, url: '/ddns' },
+      budget,
+    );
     await updateNotificationState(env.DB, key, 0, result.delivered ? 1 : 0);
     return;
   }
 
   // Healthy: clear state and send recovery if we were previously alerting.
   if (state.notified_down) {
-    if (settings.notify_recovery) {
-      const title = '🟢 DDNS Recovered';
-      const body = `${client.label} (${client.hostname}) is checking in again`;
-      const options = resolveNotificationOptions('ddns-recovery', settings.urgency);
+    const wantRecovery = recipients.filter(r => r.settings.notify_recovery);
+    if (wantRecovery.length > 0) {
       console.log(`Sending DDNS recovery notification: ${client.hostname}`);
-      const result = await sendNotifications(env.DB, vapid, { title, body, tag: key, url: '/ddns' }, options);
-      await addNotificationLogEntry(env.DB, {
-        key,
-        type: 'ddns-recovery',
-        title,
-        body,
-        urgency: options.urgency,
-        subscribersNotified: result.subscriberCount,
-        delivered: result.delivered,
-      });
+      await sendEvent(
+        env,
+        vapid,
+        wantRecovery.map(r => ({ sub: r.sub, urgency: r.settings.urgency })),
+        {
+          key,
+          type: 'ddns-recovery',
+          title: '🟢 DDNS Recovered',
+          body: `${client.label} (${client.hostname}) is checking in again`,
+          tag: key,
+          url: '/ddns',
+        },
+        budget,
+      );
     }
     await updateNotificationState(env.DB, key, 0, 0);
   }
@@ -1094,23 +1132,27 @@ async function fetchGitHubWorkflowStatus(
 }
 
 /** Detect GitHub workflow failures and send push notifications.
- *  Only polls workflows that have notifications enabled.
+ *  Only polls workflows that at least one device has enabled.
  *  Uses run ID in notification_state.consecutive_down to avoid re-notifying
  *  for the same run across scheduler cycles. */
-async function sendBuildFailureNotifications(config: DashboardConfig, env: Env): Promise<void> {
+async function sendBuildFailureNotifications(
+  config: DashboardConfig,
+  env: Env,
+  view: DispatchView,
+  budget: PushBudget,
+): Promise<void> {
   const vapid = getVapid(env);
   if (!vapid) return;
 
   const workflows = config.githubWorkflows ?? [];
   if (workflows.length === 0) return;
 
-  const allSettings = await getAllNotificationSettings(env.DB);
   const allStates = await getAllNotificationStates(env.DB);
 
   for (const wf of workflows) {
     const key = `gh:${wf.owner}/${wf.repo}/${wf.workflow}`;
-    const settings = allSettings[key] ?? { enabled: 0, failure_threshold: 1, notify_recovery: 0, urgency: null };
-    if (!settings.enabled) continue; // skip API call entirely for disabled workflows
+    const recipients = recipientsFor(view, key);
+    if (recipients.length === 0) continue; // skip the API call entirely when nobody wants it
 
     const state = allStates[key] ?? { consecutive_down: 0, notified_down: 0 };
     const runStatus = await fetchGitHubWorkflowStatus(wf.owner, wf.repo, wf.workflow, env.GITHUB_TOKEN);
@@ -1123,63 +1165,47 @@ async function sendBuildFailureNotifications(config: DashboardConfig, env: Env):
     const isFailed = runStatus.conclusion === 'failure';
     const displayName = wf.displayName ?? wf.workflow.replace(/\.(yml|yaml)$/, '');
     const repoName = wf.repo;
+    const url = `https://github.com/${wf.owner}/${wf.repo}/actions/workflows/${wf.workflow}`;
 
     if (isFailed) {
       if (!state.notified_down) {
-        const title = `❌ Build Failed: ${repoName}`;
-        const body = `${displayName} workflow failed`;
-        const options = resolveNotificationOptions('build-failed', settings.urgency);
-        console.log(`Sending build failure notification (urgency=${options.urgency}): ${repoName} / ${displayName}`);
-        const result = await sendNotifications(
-          env.DB,
+        console.log(`Sending build failure notification: ${repoName} / ${displayName}`);
+        const result = await sendEvent(
+          env,
           vapid,
+          recipients.map(r => ({ sub: r.sub, urgency: r.settings.urgency })),
           {
-            title,
-            body,
+            key,
+            type: 'build-failed',
+            title: `❌ Build Failed: ${repoName}`,
+            body: `${displayName} workflow failed`,
             tag: `build-fail-${key}`,
-            url: `https://github.com/${wf.owner}/${wf.repo}/actions/workflows/${wf.workflow}`,
+            url,
           },
-          options,
+          budget,
         );
-        await addNotificationLogEntry(env.DB, {
-          key,
-          type: 'build-failed',
-          title,
-          body,
-          urgency: options.urgency,
-          subscribersNotified: result.subscriberCount,
-          delivered: result.delivered,
-        });
         await updateNotificationState(env.DB, key, runStatus.id, result.delivered ? 1 : 0);
       } else {
         await updateNotificationState(env.DB, key, runStatus.id, 1);
       }
     } else {
-      if (state.notified_down && settings.notify_recovery) {
-        const title = `✅ Build Recovered: ${repoName}`;
-        const body = `${displayName} workflow is passing again`;
-        const options = resolveNotificationOptions('build-recovery', settings.urgency);
-        console.log(`Sending build recovery notification (urgency=${options.urgency}): ${repoName} / ${displayName}`);
-        const result = await sendNotifications(
-          env.DB,
+      const wantRecovery = recipients.filter(r => r.settings.notify_recovery);
+      if (state.notified_down && wantRecovery.length > 0) {
+        console.log(`Sending build recovery notification: ${repoName} / ${displayName}`);
+        await sendEvent(
+          env,
           vapid,
+          wantRecovery.map(r => ({ sub: r.sub, urgency: r.settings.urgency })),
           {
-            title,
-            body,
+            key,
+            type: 'build-recovery',
+            title: `✅ Build Recovered: ${repoName}`,
+            body: `${displayName} workflow is passing again`,
             tag: `build-recovery-${key}`,
-            url: `https://github.com/${wf.owner}/${wf.repo}/actions/workflows/${wf.workflow}`,
+            url,
           },
-          options,
+          budget,
         );
-        await addNotificationLogEntry(env.DB, {
-          key,
-          type: 'build-recovery',
-          title,
-          body,
-          urgency: options.urgency,
-          subscribersNotified: result.subscriberCount,
-          delivered: result.delivered,
-        });
       }
       await updateNotificationState(env.DB, key, runStatus.id, 0);
     }
@@ -1372,10 +1398,17 @@ async function handleDashboard(
   ]);
   const merged = mergeConfigWithStatus(config, cached);
 
-  // Notification settings are still deployment-wide, so only an admin may
-  // change them. Hide the bells from everyone else.
-  const vapidKey = admin ? env.VAPID_PUBLIC_KEY : undefined;
-  const html = renderDashboard(plan, config, merged, ddnsLog, vapidKey, uptime, undefined, costData, access);
+  const html = renderDashboard(
+    plan,
+    config,
+    merged,
+    ddnsLog,
+    env.VAPID_PUBLIC_KEY,
+    uptime,
+    undefined,
+    costData,
+    access,
+  );
 
   // Stream: send HTML immediately, then append chart data when ready
   const encoder = new TextEncoder();
@@ -1642,7 +1675,7 @@ async function handleApiSubscriptions(request: Request, env: Env): Promise<Respo
     if (!idStr) return jsonResponse({ error: 'Missing ?id parameter' }, 400);
     const id = parseInt(idStr, 10);
     if (isNaN(id)) return jsonResponse({ error: 'Invalid id' }, 400);
-    const deleted = await removePushSubscriptionById(env.DB, id);
+    const deleted = await deleteSubscriber(env.DB, id);
     if (!deleted) return jsonResponse({ error: 'Subscription not found' }, 404);
     return jsonResponse({ ok: true, deleted: id });
   }
@@ -1927,20 +1960,41 @@ async function handleDeleteHistory(request: Request, env: Env): Promise<Response
   return jsonResponse({ service, deleted });
 }
 
-/** API: Register a push subscription */
-async function handleApiSubscribe(request: Request, env: Env): Promise<Response> {
+/** Default cap on push subscriptions when MAX_SUBSCRIPTIONS is unset. */
+const DEFAULT_MAX_SUBSCRIPTIONS = 100;
+
+/** Every notification key this deployment can send: one per service (its
+ *  primary host), `ddns` when DDNS clients are configured, one per workflow. */
+function knownNotifyKeys(config: DashboardConfig, ddnsClients: DdnsClient[]): string[] {
+  const keys = config.panels.flatMap(p => p.services.map(s => (Array.isArray(s.host) ? s.host[0] : s.host)));
+  if (ddnsClients.length > 0) keys.push('ddns');
+  for (const wf of config.githubWorkflows ?? []) keys.push(`gh:${wf.owner}/${wf.repo}/${wf.workflow}`);
+  return keys;
+}
+
+/** Read a JSON body, or null if it isn't one. */
+async function readJson<T>(request: Request): Promise<T | null> {
+  try {
+    return (await request.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+/** API: Register a push subscription.
+ *
+ *  Open to public-mode visitors, so it's guarded twice: an optional shared
+ *  SUBSCRIBE_PASSWORD (admins are exempt), and a cap on how many devices may
+ *  subscribe, MAX_SUBSCRIPTIONS (admins are exempt from that too). */
+async function handleApiSubscribe(request: Request, env: Env, admin: boolean): Promise<Response> {
   if (request.method !== 'POST') return jsonResponse({ error: 'Method not allowed' }, 405);
 
   if (!getVapid(env)) {
     return jsonResponse({ error: 'Push notifications not configured (VAPID incomplete)' }, 503);
   }
 
-  let body: { endpoint?: string; keys?: { p256dh?: string; auth?: string } };
-  try {
-    body = (await request.json()) as typeof body;
-  } catch {
-    return jsonResponse({ error: 'Invalid JSON' }, 400);
-  }
+  const body = await readJson<{ endpoint?: string; keys?: { p256dh?: string; auth?: string }; code?: string }>(request);
+  if (!body) return jsonResponse({ error: 'Invalid JSON' }, 400);
 
   if (!body.endpoint || !body.keys?.p256dh || !body.keys?.auth) {
     return jsonResponse({ error: 'Missing required fields: endpoint, keys.p256dh, keys.auth' }, 400);
@@ -1960,79 +2014,100 @@ async function handleApiSubscribe(request: Request, env: Env): Promise<Response>
     return jsonResponse({ error: 'Endpoint URL too long' }, 400);
   }
 
-  await addPushSubscription(env.DB, body.endpoint, body.keys.p256dh, body.keys.auth);
+  if (!admin && !(await verifySubscribeCode(env, body.code))) {
+    return jsonResponse({ error: 'A subscribe code is required', codeRequired: true }, 403);
+  }
+
+  // Re-subscribing a known device never counts against the cap.
+  const existing = await getSubscriberByEndpoint(env.DB, body.endpoint);
+  if (!existing && !admin) {
+    const max = Number(env.MAX_SUBSCRIPTIONS) || DEFAULT_MAX_SUBSCRIPTIONS;
+    if ((await countSubscribers(env.DB)) >= max) {
+      return jsonResponse({ error: 'This status page has reached its subscriber limit' }, 429);
+    }
+  }
+
+  await upsertSubscriber(env.DB, {
+    endpoint: body.endpoint,
+    p256dh: body.keys.p256dh,
+    auth: body.keys.auth,
+    isAdmin: admin,
+  });
   return jsonResponse({ ok: true });
 }
 
-/** API: Remove a push subscription */
+/** API: Remove a push subscription. Knowing the endpoint is the authority. */
 async function handleApiUnsubscribe(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'POST') return jsonResponse({ error: 'Method not allowed' }, 405);
 
-  let body: { endpoint?: string };
-  try {
-    body = (await request.json()) as typeof body;
-  } catch {
-    return jsonResponse({ error: 'Invalid JSON' }, 400);
-  }
+  const body = await readJson<{ endpoint?: string }>(request);
+  if (!body) return jsonResponse({ error: 'Invalid JSON' }, 400);
+  if (!body.endpoint) return jsonResponse({ error: 'Missing endpoint' }, 400);
 
-  if (!body.endpoint) {
-    return jsonResponse({ error: 'Missing endpoint' }, 400);
-  }
-
-  await removePushSubscription(env.DB, body.endpoint);
+  await deleteSubscriberByEndpoint(env.DB, body.endpoint);
   return jsonResponse({ ok: true });
 }
 
-/** API: Get or update notification settings for a key.
- *  GET without ?key returns all settings (bulk); with ?key returns one. */
-async function handleApiNotificationSettings(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url);
+/** API: One device's notification settings. POST only, because the endpoint
+ *  that identifies the device must never sit in a URL or an access log.
+ *
+ *    { endpoint }                    → { settings: { [key]: settings } } for every key
+ *    { endpoint, key, enabled, ... } → set that one key for this device
+ *
+ *  Unknown devices get 404, so a stranger can't probe for or edit anyone's
+ *  settings without already holding their endpoint. */
+async function handleApiNotificationSettings(
+  request: Request,
+  env: Env,
+  config: DashboardConfig,
+  ddnsClients: DdnsClient[],
+): Promise<Response> {
+  if (request.method !== 'POST') return jsonResponse({ error: 'Method not allowed' }, 405);
 
-  if (request.method === 'GET') {
-    const key = url.searchParams.get('key');
-    if (key) {
-      const settings = await getNotificationSettings(env.DB, key);
-      return jsonResponse({ key, ...settings });
+  const body = await readJson<{
+    endpoint?: string;
+    key?: string;
+    enabled?: number;
+    failure_threshold?: number;
+    notify_recovery?: number;
+    urgency?: string;
+  }>(request);
+  if (!body) return jsonResponse({ error: 'Invalid JSON' }, 400);
+  if (!body.endpoint) return jsonResponse({ error: 'Missing endpoint' }, 400);
+
+  const sub = await getSubscriberByEndpoint(env.DB, body.endpoint);
+  if (!sub) return jsonResponse({ error: 'Unknown device. Subscribe first.' }, 404);
+
+  const keys = knownNotifyKeys(config, ddnsClients);
+
+  if (body.key === undefined) {
+    const explicit = await getSubscriberSettings(env.DB, sub.id);
+    const settings: Record<string, NotificationSettings> = {};
+    for (const key of keys) {
+      if (isAdminOnlyKey(key) && !sub.is_admin) continue;
+      settings[key] = effectiveSettings(sub, explicit, key);
     }
-    // Bulk: return all notification settings in one response
-    const all = await getAllNotificationSettings(env.DB);
-    return jsonResponse(all);
+    return jsonResponse({ settings });
   }
 
-  if (request.method === 'POST') {
-    let body: {
-      key?: string;
-      enabled?: number;
-      failure_threshold?: number;
-      notify_recovery?: number;
-      urgency?: string;
-    };
-    try {
-      body = (await request.json()) as typeof body;
-    } catch {
-      return jsonResponse({ error: 'Invalid JSON' }, 400);
-    }
-
-    if (!body.key) return jsonResponse({ error: 'Missing key' }, 400);
-
-    const enabled =
-      typeof body.enabled === 'number' && Number.isFinite(body.enabled) ? (body.enabled === 0 ? 0 : 1) : 0;
-    const failure_threshold = typeof body.failure_threshold === 'number' ? Math.max(1, body.failure_threshold) : 1;
-    const notify_recovery =
-      typeof body.notify_recovery === 'number' && Number.isFinite(body.notify_recovery)
-        ? body.notify_recovery === 0
-          ? 0
-          : 1
-        : 0;
-    const validUrgencies = ['very-low', 'low', 'normal', 'high'];
-    const urgency =
-      typeof body.urgency === 'string' && validUrgencies.includes(body.urgency) ? (body.urgency as PushUrgency) : null;
-
-    await setNotificationSettings(env.DB, body.key, { enabled, failure_threshold, notify_recovery, urgency });
-    return jsonResponse({ ok: true });
+  // Only real keys, so the table can't be filled with junk rows.
+  if (!keys.includes(body.key)) return jsonResponse({ error: 'Unknown key' }, 400);
+  if (isAdminOnlyKey(body.key) && !sub.is_admin) {
+    return jsonResponse({ error: 'Only an admin device can subscribe to this' }, 403);
   }
 
-  return jsonResponse({ error: 'Method not allowed' }, 405);
+  const enabled = typeof body.enabled === 'number' && body.enabled !== 0 ? 1 : 0;
+  const failure_threshold =
+    typeof body.failure_threshold === 'number' && Number.isFinite(body.failure_threshold)
+      ? Math.min(1000, Math.max(1, Math.floor(body.failure_threshold)))
+      : 1;
+  const notify_recovery = body.notify_recovery === 1 ? 1 : 0;
+  const validUrgencies = ['very-low', 'low', 'normal', 'high'];
+  const urgency =
+    typeof body.urgency === 'string' && validUrgencies.includes(body.urgency) ? (body.urgency as PushUrgency) : null;
+
+  await setSubscriberSetting(env.DB, sub.id, body.key, { enabled, failure_threshold, notify_recovery, urgency });
+  return jsonResponse({ ok: true });
 }
 
 /** Helper: Create JSON response */
@@ -2143,7 +2218,7 @@ async function pollCloudflareUsageSafely(env: Env): Promise<void> {
 }
 
 /** Check thresholds + dispatch any alerts. Wrapped so a failure can't bubble. */
-async function checkAndFireThresholdAlerts(env: Env): Promise<void> {
+async function checkAndFireThresholdAlerts(env: Env, budget: PushBudget): Promise<void> {
   if (!env.DB || !env.KV) return;
   try {
     const alerts = await checkThresholds(env.KV, env.DB);
@@ -2153,6 +2228,9 @@ async function checkAndFireThresholdAlerts(env: Env): Promise<void> {
       console.warn(`Cost monitor: ${alerts.length} threshold alert(s) but VAPID not configured`);
       return;
     }
+    // Spend is admin-only data: every admin device gets it, nobody else does.
+    const { subscribers } = await loadDispatchView(env.DB);
+    const recipients = subscribers.filter(s => s.is_admin).map(sub => ({ sub, urgency: null }));
     const fired: typeof alerts = [];
     for (const alert of alerts) {
       const { title, body } = alertNotificationContent(alert);
@@ -2162,16 +2240,14 @@ async function checkAndFireThresholdAlerts(env: Env): Promise<void> {
         silent: false,
       };
       try {
-        const result = await sendNotifications(env.DB, vapid, { title, body, tag: alert.key, url: '/' }, options);
-        await addNotificationLogEntry(env.DB, {
-          key: alert.key,
-          type: 'usage-threshold',
-          title,
-          body,
-          urgency: options.urgency,
-          subscribersNotified: result.subscriberCount,
-          delivered: result.delivered,
-        });
+        await sendEvent(
+          env,
+          vapid,
+          recipients,
+          { key: alert.key, type: 'usage-threshold', title, body, tag: alert.key, url: '/' },
+          budget,
+          options,
+        );
         fired.push(alert);
         console.log(`Cost monitor: fired alert ${alert.key} — ${body}`);
       } catch (err) {

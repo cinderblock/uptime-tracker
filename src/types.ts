@@ -347,6 +347,11 @@ export interface Env {
    *  logged-in admin sees DDNS, cost, errors and the admin pages. Unset keeps
    *  the all-or-nothing behaviour above. See README "Public mode". */
   PUBLIC_DASHBOARD?: string;
+  /** Shared code a non-admin must enter to subscribe to push notifications
+   *  (secret). Unset: anyone who can see the dashboard may subscribe. */
+  SUBSCRIBE_PASSWORD?: string;
+  /** Most push subscriptions accepted from non-admins. Default 100. */
+  MAX_SUBSCRIPTIONS?: string;
 }
 
 /** Who is looking at the dashboard, and whether they could log in. */
@@ -355,4 +360,6 @@ export interface DashboardAccess {
   admin: boolean;
   /** A password is set: offer non-admins an Admin link, and admins Log out. */
   loginAvailable: boolean;
+  /** Subscribing needs SUBSCRIBE_PASSWORD (set, and the viewer isn't an admin). */
+  subscribeCodeRequired: boolean;
 }

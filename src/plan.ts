@@ -35,6 +35,9 @@ export interface PlanProfile {
   checkBudget: number;
   /** Max GitHub API calls per tick (workflow badges + timeline lanes). */
   githubBudget: number;
+  /** Max push deliveries per tick, across every device and notification type.
+   *  Each is one subrequest. Devices past it get service alerts next tick. */
+  pushBudget: number;
   /** Concurrency pool default: "max periodMs start increment".
    *  Free plans get 6 simultaneous outgoing connections, so ramping past that
    *  buys nothing. */
@@ -62,6 +65,7 @@ const PROFILES: Record<PlanTier, PlanProfile> = {
     cronIntervalMinutes: 1,
     checkBudget: 500,
     githubBudget: 30,
+    pushBudget: 500,
     checkConcurrency: '25',
     aggregateStore: 'kv',
     historyRetentionDays: 30,
@@ -78,6 +82,8 @@ const PROFILES: Record<PlanTier, PlanProfile> = {
     // polling, push delivery, and check retries.
     checkBudget: 30,
     githubBudget: 5,
+    // checkBudget + githubBudget + pushBudget = 45, leaving 5 of the 50.
+    pushBudget: 10,
     // 6 simultaneous outgoing connections on free — ramping beyond that is a no-op.
     checkConcurrency: '6',
     aggregateStore: 'd1',

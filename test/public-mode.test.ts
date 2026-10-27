@@ -120,6 +120,14 @@ describe('public-mode allowlist', () => {
     expect(isPublicModePath('/api/history', 'GET')).toBe(true);
   });
 
+  // Each of these authorises by the device's own push endpoint. See
+  // subscribers.test.ts for what a stranger can and can't do with them.
+  test('a device may manage its own push subscription', () => {
+    for (const path of ['/api/subscribe', '/api/unsubscribe', '/api/notification-settings']) {
+      expect(isPublicModePath(path, 'POST')).toBe(true);
+    }
+  });
+
   test('writes and admin pages are not', () => {
     expect(isPublicModePath('/api/history', 'DELETE')).toBe(false);
     for (const path of [
@@ -131,9 +139,6 @@ describe('public-mode allowlist', () => {
       '/api/cost',
       '/api/subscriptions',
       '/subscriptions',
-      '/api/notification-settings',
-      '/api/subscribe',
-      '/api/unsubscribe',
       '/some-endpoint-added-later',
     ]) {
       expect(isPublicModePath(path, 'GET')).toBe(false);
@@ -176,7 +181,6 @@ describe('the gate, through the worker', () => {
     ['GET', '/subscriptions'],
     ['GET', '/api/subscriptions'],
     ['DELETE', '/api/subscriptions?id=1'],
-    ['POST', '/api/notification-settings'],
     ['POST', '/api/probe'],
     ['DELETE', '/api/history?service=x'],
   ])('anonymous %s %s gets the login page, not the endpoint', async (method, path) => {

@@ -213,8 +213,8 @@ while everything else stays behind the login. Anonymous visitors get:
 - service status, uptime, latency charts and the event timeline;
 - **no** DDNS log or DDNS timeline lanes (they reveal home networks), cost panel,
   errors page, history deletion, probe submission, or subscriber admin;
-- no push notification controls. Notification settings are deployment-wide, so
-  only an admin may change them.
+- push notifications for their own device, if push is configured (see below).
+  DDNS and cost alerts stay admin-only.
 
 Which paths are public is an **allowlist** in `src/auth.ts`. A new endpoint
 stays admin-only until it's added there on purpose. Without a password, public
@@ -234,8 +234,35 @@ private key as a secret:
 wrangler secret put VAPID_PRIVATE_KEY
 ```
 
-Then subscribe from the dashboard. Per-service thresholds, recovery notices, and
-urgency are configurable from the bell toggles in the UI.
+Then subscribe from the dashboard.
+
+**Settings are per device.** Each subscribed browser picks its own services,
+failure threshold, recovery notices and urgency from the 🔔 bells. Clicking a
+bell on a device that isn't subscribed subscribes it first. A new device starts
+with every service on, including recovery notices. GitHub workflows stay opt-in,
+because each enabled one costs a GitHub API call per tick.
+
+A device is identified by its push endpoint, an unguessable URL the browser
+holds, so it can only see and change its own settings. The endpoint only ever
+travels in POST bodies, never in URLs, so it doesn't land in access logs.
+
+| Setting                       | Effect                                                                                                                                                                            |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SUBSCRIBE_PASSWORD` (secret) | A shared code a non-admin must enter once to subscribe. Unset: anyone who can see the dashboard may. Changing it doesn't drop existing devices; remove those on `/subscriptions`. |
+| `MAX_SUBSCRIPTIONS` (var)     | Most devices accepted from non-admins. Default 100. Known devices re-subscribing, and admins, don't count against it.                                                             |
+
+A device subscribed by a logged-in admin (or in open or gated mode) is an
+**admin device**. Only admin devices can receive DDNS and cost alerts, which
+reveal hostnames, IPs and spend.
+
+**Push budget.** Each delivery is one subrequest, so the plan caps deliveries per
+tick (`pushBudget` in `src/plan.ts`: 10 on free, 500 on paid). A device past the
+cap gets its service alert on the next tick. One-shot events (DDNS, build, cost)
+aren't retried, and the log says how many devices missed them.
+
+**Upgrading** (migration `0012`): every existing device gets a copy of the old
+deployment-wide settings, and keeps "no setting means off", so nothing changes
+until someone edits a bell.
 
 ## Optional integrations
 
