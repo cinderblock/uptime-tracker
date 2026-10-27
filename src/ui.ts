@@ -327,7 +327,10 @@ export function renderDashboard(
     .gh-badge-bell { font-size: 0.688rem; }
 
     /* Event timeline (correlation swimlanes) */
-    .timeline-section { max-width: 1400px; margin: 0 auto 1rem; }
+    /* 1.5rem top matches .ddns-section/.gh-section and the .dashboard grid gap,
+       so this sits the same distance below whatever precedes it. Without it the
+       timeline butts straight against the grid, which has no bottom margin. */
+    .timeline-section { max-width: 1400px; margin: 1.5rem auto 1rem; }
     .timeline { padding: 0.5rem 0.25rem 0.25rem; overflow: hidden; }
     .timeline svg { display: block; width: 100%; }
     .timeline .chart-loading { padding: 1rem; text-align: center; color: var(--text-muted); font-size: 0.75rem; }
