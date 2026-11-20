@@ -23,6 +23,7 @@
  * split needs no data migration.
  */
 
+import { checksSince, unionChecks } from './check-tables';
 import type { GenerationMemo } from './read-memo';
 import type { CheckResult } from './types';
 
@@ -424,8 +425,9 @@ async function buildUptimeFromDB(db: D1Database, now: number): Promise<UptimeBuc
               CAST(timestamp / ${HOUR_MS} AS INTEGER) AS hb,
               COUNT(*) AS totals,
               SUM(CASE WHEN status = 'up' THEN 1 ELSE 0 END) AS ups
-       FROM checks
-       WHERE timestamp > ?1
+       FROM (
+${unionChecks(t => `SELECT service, timestamp, status FROM ${t} WHERE ${checksSince(t, '?1')}`)}
+       )
        GROUP BY service, hb`,
     )
     .bind(now - HISTORY_RETENTION_MS)
@@ -458,8 +460,12 @@ async function buildChartFromDB(db: D1Database, now: number): Promise<ChartTiere
             CASE WHEN status = 'down' THEN 0 ELSE 1 END,
             latency DESC
         ) AS rn
-      FROM checks
-      WHERE timestamp > ?4 AND type IN ('https', 'secret')
+      FROM (
+${unionChecks(
+  t => `SELECT service, url, timestamp, latency, status, code, error FROM ${t}
+        WHERE ${checksSince(t, '?4')} AND type IN ('https', 'secret')`,
+)}
+      )
     )
     WHERE rn = 1
     ORDER BY service, url, timestamp ASC

@@ -117,8 +117,8 @@ describe('backfillRollup (PLAN=paid -> free)', () => {
   });
 });
 
-describe('errors query (migration 0010)', () => {
-  test('uses the status index rather than walking the timestamp index', () => {
+describe('errors query (migrations 0010, 0013)', () => {
+  test('uses the down-only index rather than walking every healthy row', () => {
     const plan = db
       .prepare(
         `EXPLAIN QUERY PLAN SELECT service FROM checks WHERE status = 'down' AND timestamp > ?
@@ -127,8 +127,10 @@ describe('errors query (migration 0010)', () => {
       .all(0)
       .map((r: any) => r.detail)
       .join(' ');
-    // Without idx_checks_status_timestamp this scans every healthy row to find
-    // the failures — the healthier the fleet, the more it reads.
-    expect(plan).toContain('idx_checks_status_timestamp');
+    // Without a status-aware index this scans every healthy row to find the
+    // failures — the healthier the fleet, the more it reads. 0010 added
+    // idx_checks_status_timestamp; 0013's table replaces it with the partial
+    // idx_checks_down_ts, which up rows don't pay for.
+    expect(plan).toContain('idx_checks_down_ts');
   });
 });

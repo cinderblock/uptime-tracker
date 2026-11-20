@@ -11,6 +11,7 @@ import type {
   TransitionsState,
 } from './types';
 import type { PlanProfile } from './plan';
+import { CHECK_TABLES, DELETE_CHECKS_BEFORE, unionChecks } from './check-tables';
 import type { GenerationMemo } from './read-memo';
 import {
   getChartData as getKvChart,
@@ -116,13 +117,12 @@ export async function getCheckHistory(
 
   const results = await db
     .prepare(
-      `
-    SELECT timestamp, status, latency, code, error
-    FROM checks
-    WHERE service = ? AND url = ?
-    ORDER BY timestamp DESC
-    LIMIT ?
-  `,
+      `SELECT * FROM (
+${unionChecks(
+  t => `SELECT timestamp, status, latency, code, error FROM ${t}
+        WHERE service = ?1 AND url = ?2 ORDER BY timestamp DESC LIMIT ?3`,
+)}
+) ORDER BY timestamp DESC LIMIT ?3`,
     )
     .bind(serviceName, url, limit)
     .all<{
@@ -201,8 +201,12 @@ export async function getLastCheckedTimes(
 export async function deleteServiceHistory(db: D1Database | undefined, service: string): Promise<number> {
   if (!db) return 0;
 
-  const result = await db.prepare(`DELETE FROM checks WHERE service = ?`).bind(service).run();
-  return result.meta.changes ?? 0;
+  let deleted = 0;
+  for (const t of CHECK_TABLES) {
+    const result = await db.prepare(`DELETE FROM ${t} WHERE service = ?`).bind(service).run();
+    deleted += result.meta.changes ?? 0;
+  }
+  return deleted;
 }
 
 /** Clean up old history entries. `retentionDays` comes from the plan profile
@@ -212,16 +216,12 @@ export async function cleanupHistory(db: D1Database | undefined, retentionDays =
 
   const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
 
-  const result = await db
-    .prepare(
-      `
-    DELETE FROM checks WHERE timestamp < ?
-  `,
-    )
-    .bind(cutoff)
-    .run();
-
-  return result.meta.changes ?? 0;
+  let deleted = (await db.prepare(DELETE_CHECKS_BEFORE).bind(cutoff).run()).meta.changes ?? 0;
+  // The legacy table still has its timestamp index.
+  for (const t of CHECK_TABLES.filter(t => t !== 'checks')) {
+    deleted += (await db.prepare(`DELETE FROM ${t} WHERE timestamp < ?`).bind(cutoff).run()).meta.changes ?? 0;
+  }
+  return deleted;
 }
 
 // ── Transition timeline (correlation swimlanes) ──────────────────────────────
@@ -490,16 +490,18 @@ export async function getRecentErrors(
   if (!db) return [];
 
   const since = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
-  const query = service
-    ? `SELECT service, url, type, code, error, latency, source, timestamp
-       FROM checks WHERE status = 'down' AND timestamp > ? AND service = ?
-       ORDER BY timestamp DESC LIMIT ?`
-    : `SELECT service, url, type, code, error, latency, source, timestamp
-       FROM checks WHERE status = 'down' AND timestamp > ?
-       ORDER BY timestamp DESC LIMIT ?`;
+  // ?1 since, ?2 limit, ?3 the optional service. On `checks` the partial
+  // down-only timestamp index (or (service, timestamp)) serves this directly.
+  const query = `SELECT * FROM (
+${unionChecks(
+  t => `SELECT service, url, type, code, error, latency, source, timestamp FROM ${t}
+        WHERE status = 'down' AND timestamp > ?1${service ? ' AND service = ?3' : ''}
+        ORDER BY timestamp DESC LIMIT ?2`,
+)}
+) ORDER BY timestamp DESC LIMIT ?2`;
 
   const stmt = db.prepare(query);
-  const bound = service ? stmt.bind(since, service, limit) : stmt.bind(since, limit);
+  const bound = service ? stmt.bind(since, limit, service) : stmt.bind(since, limit);
 
   const results = await bound.all<{
     service: string;

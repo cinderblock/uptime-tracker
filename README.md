@@ -84,6 +84,18 @@ rewritten once an hour; each tick writes only a small blob for the current hour
 ([`src/rollups.ts`](src/rollups.ts)). Rewriting the megabyte blobs every tick had
 been most of the cron's CPU.
 
+Raw check results go in `checks`, and on either plan they're the biggest D1
+write cost. Every index entry counts as a row written, so `checks` has only two
+indexes: `(service, timestamp)`, and `timestamp` for failed checks only. That
+makes 2 rows written per check. Time-bounded reads that neither index covers
+look up the time's id instead (ids rise with time,
+[`src/check-tables.ts`](src/check-tables.ts)).
+
+**Upgrading** (migration `0013`): the old table is renamed `checks_legacy`
+rather than copied, because a copy would cost about a day of the free plan's
+write allowance. Readers query both tables until retention empties it. A later
+migration drops it.
+
 One consequence worth knowing: chart resolution differs. The paid tiers keep
 1/10/30/120-minute buckets for the primary HTTPS URL of each service. On free,
 anything older than 6 hours comes from the hourly rollup, which has no URL or
@@ -407,6 +419,7 @@ which case the panel stays hidden and no DDNS alerting runs.
 | `storage.ts`         | D1 + KV access, history; dispatches aggregates by plan           |
 | `rollups.ts`         | Paid: chart tiers + uptime counters in KV, hourly fold           |
 | `storage-free.ts`    | Free: aggregates in D1 (`uptime_hourly`, `blobs`)                |
+| `check-tables.ts`    | Raw check tables, id-bounded time reads and retention            |
 | `ui.ts`              | Dashboard HTML                                                   |
 | `auth.ts`            | Signed-cookie session auth                                       |
 | `rate-limit.ts`      | Per-IP request limiting for non-admins                           |
