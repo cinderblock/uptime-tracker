@@ -11,30 +11,32 @@ import type {
   TransitionsState,
 } from './types';
 import type { PlanProfile } from './plan';
-import { blobGet, blobPut, getChartFromRollup, getUptimeFromRollup } from './storage-free';
+import type { GenerationMemo } from './read-memo';
+import {
+  getChartData as getKvChart,
+  getMultiPeriodUptime as getKvUptime,
+  recordTickRollups,
+  type ChartData,
+  type UptimeByPeriod,
+} from './rollups';
+import { blobGet, blobPut, getChartFromRollup, getUptimeFromRollup, rollUpHourly } from './storage-free';
 
 // ── Plan dispatch ────────────────────────────────────────────────────────────
 // Every public function below that touches derived state takes the resolved
 // `PlanProfile` as its first argument and branches on `plan.aggregateStore`.
 //
-//   'kv' (paid) — the original implementation, unchanged. Large precomputed KV
-//                 blobs; D1 is never read from a request handler.
+//   'kv' (paid) — precomputed KV blobs; D1 is never read from a request
+//                 handler. Chart + uptime rollups live in src/rollups.ts.
 //   'd1' (free) — src/storage-free.ts. Small blobs move to the `blobs` table;
 //                 the large chart/uptime blobs are not maintained at all and
 //                 their data is derived from `uptime_hourly` on read.
 //
-// The paid path is a live production system: treat its branches as frozen.
+// The paid path runs the ops deployment: change it deliberately, and measure.
 
 /** True when the caller is on the free profile's D1 storage path. */
 function useD1(plan: PlanProfile): boolean {
   return plan.aggregateStore === 'd1';
 }
-
-// Default history retention (30 days in ms). Callers pass the plan profile's
-// `historyRetentionDays` instead; this is the paid profile's value, kept as the
-// default so the paid behaviour is unchanged, and still used by the paid-only
-// one-time backfills below.
-const HISTORY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 // ── KV hot-path cache ────────────────────────────────────────────────────────
 // Dashboard status and last-checked times are batched into a single KV key
@@ -43,12 +45,8 @@ const HISTORY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const KV_HOT_KEY = 'cache:hot';
 const KV_DDNS_KEY = 'cache:ddns';
 
-// Durable, incrementally-maintained derived state. No TTL — losing these means
-// running a one-time D1 backfill to repopulate (see backfillChartTiered etc).
-// They are the source of truth for chart + uptime on the read path; D1 is
-// never consulted from request handlers.
-const KV_CHART_TIERED_KEY = 'cache:chart-tiered';
-const KV_UPTIME_BUCKETS_KEY = 'cache:uptime-buckets';
+// Durable, incrementally-maintained derived state. No TTL. The chart and uptime
+// rollups live in rollups.ts.
 const KV_TRANSITIONS_KEY = 'cache:transitions';
 
 interface HotCache {
@@ -144,152 +142,44 @@ export async function getCheckHistory(
   }));
 }
 
-export interface UptimeByPeriod {
-  uptime24h: number | null;
-  uptime7d: number | null;
-  uptime30d: number | null;
-  checkCount24h: number;
-  checkCount7d: number;
-  checkCount30d: number;
-}
+// ── Chart + uptime rollups ───────────────────────────────────────────────────
+// Paid: rollups.ts (KV, hot/cold). Free: storage-free.ts (D1 `uptime_hourly`).
 
-const HOUR_MS = 60 * 60 * 1000;
-
-interface UptimeHourBucket {
-  ups: number;
-  totals: number;
-}
-
-/** Per-service per-hour up/total counters. Incrementally maintained by the
- *  minute cron via updateUptimeBuckets; durable (no TTL). */
-type UptimeBucketsState = Record<string, Record<string, UptimeHourBucket>>;
-
-function hourBucket(tsMs: number): number {
-  return Math.floor(tsMs / HOUR_MS);
-}
-
-/** Get uptime stats for multiple time periods.
- *
- *  Paid: reads incrementally-maintained KV state — never queries D1. If state
- *  is missing (fresh deploy before backfill), returns {}.
- *  Free: one grouped query over the `uptime_hourly` rollup. */
+/** Get uptime stats for 24h / 7d / 30d. */
 export async function getMultiPeriodUptime(
   plan: PlanProfile,
   kv: KVNamespace | undefined,
   db: D1Database | undefined,
+  memo: GenerationMemo,
 ): Promise<Record<string, UptimeByPeriod>> {
   if (useD1(plan)) return getUptimeFromRollup(db, plan.historyRetentionDays);
-  if (!kv) return {};
-  const raw = await kv.get(KV_UPTIME_BUCKETS_KEY);
-  if (!raw) return {};
-  const state = JSON.parse(raw) as UptimeBucketsState;
-
-  const nowHb = hourBucket(Date.now());
-  const cutoff24h = nowHb - 24;
-  const cutoff7d = nowHb - 7 * 24;
-  const cutoff30d = nowHb - 30 * 24;
-
-  const stats: Record<string, UptimeByPeriod> = {};
-  for (const [service, buckets] of Object.entries(state)) {
-    let up24h = 0,
-      total24h = 0,
-      up7d = 0,
-      total7d = 0,
-      up30d = 0,
-      total30d = 0;
-    for (const [hbStr, { ups, totals }] of Object.entries(buckets)) {
-      const hb = Number(hbStr);
-      if (hb >= cutoff30d) {
-        up30d += ups;
-        total30d += totals;
-      }
-      if (hb >= cutoff7d) {
-        up7d += ups;
-        total7d += totals;
-      }
-      if (hb >= cutoff24h) {
-        up24h += ups;
-        total24h += totals;
-      }
-    }
-    stats[service] = {
-      uptime24h: total24h > 0 ? (up24h / total24h) * 100 : null,
-      uptime7d: total7d > 0 ? (up7d / total7d) * 100 : null,
-      uptime30d: total30d > 0 ? (up30d / total30d) * 100 : null,
-      checkCount24h: total24h,
-      checkCount7d: total7d,
-      checkCount30d: total30d,
-    };
-  }
-  return stats;
+  return getKvUptime(kv, memo);
 }
 
-/** Incrementally update per-service per-hour up/total counters from fresh
- *  check results, age out buckets >30d, and self-backfill from D1 the first
- *  time the KV blob is missing. Single KV read on the steady-state path.
- *
- *  Free: no-op. The equivalent counters live in `uptime_hourly`, maintained by
- *  `rollUpHourly` from the cron — this blob is never created on that plan. */
-export async function updateUptimeBuckets(
+/** Chart data for every service's primary check. */
+export async function getChartData(
   plan: PlanProfile,
   kv: KVNamespace | undefined,
   db: D1Database | undefined,
-  freshResults: CheckResult[],
-): Promise<void> {
-  if (useD1(plan)) return;
-  if (!kv) return;
-  const raw = await kv.get(KV_UPTIME_BUCKETS_KEY);
-  if (raw === null) {
-    if (db) {
-      console.log('Backfilling uptime-buckets KV state from D1 (one-time)...');
-      await backfillUptimeBuckets(kv, db);
-    }
-    return;
-  }
-  if (freshResults.length === 0) return;
-  const state = JSON.parse(raw) as UptimeBucketsState;
-
-  for (const r of freshResults) {
-    const hbKey = String(hourBucket(r.timestamp));
-    const svc = (state[r.service] ??= {});
-    const bucket = (svc[hbKey] ??= { ups: 0, totals: 0 });
-    bucket.totals++;
-    if (r.status === 'up') bucket.ups++;
-  }
-
-  const cutoff = hourBucket(Date.now()) - 30 * 24;
-  for (const svc of Object.keys(state)) {
-    for (const hbKey of Object.keys(state[svc])) {
-      if (Number(hbKey) < cutoff) delete state[svc][hbKey];
-    }
-  }
-
-  await kv.put(KV_UPTIME_BUCKETS_KEY, JSON.stringify(state));
+  memo: GenerationMemo,
+): Promise<ChartData> {
+  if (useD1(plan)) return getChartFromRollup(db, plan.historyRetentionDays);
+  return getKvChart(kv, memo);
 }
 
-/** One-shot backfill of the uptime buckets blob from `checks`. Called by
- *  updateUptimeBuckets when the KV blob is missing; only runs on first
- *  deploy (or recovery if KV state is lost). */
-export async function backfillUptimeBuckets(kv: KVNamespace, db: D1Database): Promise<void> {
-  const since = Date.now() - HISTORY_RETENTION_MS;
-  const results = await db
-    .prepare(
-      `SELECT service,
-              CAST(timestamp / ${HOUR_MS} AS INTEGER) AS hb,
-              COUNT(*) AS totals,
-              SUM(CASE WHEN status = 'up' THEN 1 ELSE 0 END) AS ups
-       FROM checks
-       WHERE timestamp > ?
-       GROUP BY service, hb`,
-    )
-    .bind(since)
-    .all<{ service: string; hb: number; totals: number; ups: number }>();
-
-  const state: UptimeBucketsState = {};
-  for (const r of results.results) {
-    (state[r.service] ??= {})[String(r.hb)] = { ups: r.ups, totals: r.totals };
-  }
-  await kv.put(KV_UPTIME_BUCKETS_KEY, JSON.stringify(state));
+/** Add one tick's results to the rollups. Free: `rollUpHourly` instead.
+ *  Call after `addToHistory` (a missing cold blob is rebuilt from D1 and must
+ *  include this tick) and before `saveCurrentStatus` (its lastUpdate keys the
+ *  readers' memo). */
+export async function recordRollups(
+  plan: PlanProfile,
+  kv: KVNamespace | undefined,
+  db: D1Database | undefined,
+  results: CheckResult[],
+  now: number,
+): Promise<void> {
+  if (useD1(plan)) return rollUpHourly(db, results, plan.historyRetentionDays);
+  return recordTickRollups(kv, db, results, now);
 }
 
 /** Get the most recent check timestamp per service (for stochastic ordering).
@@ -332,258 +222,6 @@ export async function cleanupHistory(db: D1Database | undefined, retentionDays =
     .run();
 
   return result.meta.changes ?? 0;
-}
-
-/** Chart data for all HTTPS endpoints with logarithmic time decimation.
- *  Returns more points for recent data and fewer for older data,
- *  optimized for display on a power-law time axis.
- *
- *  Tier buckets (worst-of-bucket selection preserves outages):
- *    Last 6h  → 1-min   (~360 pts/service)
- *    6h–2d    → 10-min  (~216 pts/service)
- *    2d–7d    → 30-min  (~240 pts/service)
- *    7d–30d+  → 2-hour  (~276 pts/service)
- *
- *  State is maintained incrementally per cron tick (see updateChartTiered);
- *  the read path never touches D1.
- */
-
-/** Compact chart point: [timestamp, latency, statusBit, code?, error?]
- *  statusBit: 1 = up, 0 = down.  Trailing fields omitted when absent. */
-export type ChartDataPoint = [ts: number, lat: number, up: number, code?: number, error?: string];
-export type ChartData = Record<string, ChartDataPoint[]>;
-
-const MIN_MS = 60_000;
-const T1_MAX_AGE_MS = 6 * 60 * MIN_MS;
-const T10_MAX_AGE_MS = 2 * 24 * 60 * MIN_MS;
-const T30_MAX_AGE_MS = 7 * 24 * 60 * MIN_MS;
-const T120_MAX_AGE_MS = 30 * 24 * 60 * MIN_MS;
-const T10_BUCKET_MS = 10 * MIN_MS;
-const T30_BUCKET_MS = 30 * MIN_MS;
-const T120_BUCKET_MS = 120 * MIN_MS;
-
-interface ServiceTiers {
-  primaryUrl: string;
-  t1: ChartDataPoint[];
-  t10: ChartDataPoint[];
-  t30: ChartDataPoint[];
-  t120: ChartDataPoint[];
-}
-
-type ChartTieredState = Record<string, ServiceTiers>;
-
-function encodePoint(r: CheckResult): ChartDataPoint {
-  const pt: ChartDataPoint = [r.timestamp, r.latency, r.status === 'up' ? 1 : 0];
-  if (r.code) pt.push(r.code);
-  if (r.error) {
-    if (pt.length === 3) pt.push(0); // code placeholder so error slot is 4
-    pt.push(r.error);
-  }
-  return pt;
-}
-
-/** "Down beats up; tied → higher latency wins" — matches the existing
- *  decimation query's ORDER BY clause. */
-function isWorse(a: ChartDataPoint, b: ChartDataPoint): boolean {
-  const aDown = a[2] === 0;
-  const bDown = b[2] === 0;
-  if (aDown !== bDown) return aDown && !bDown;
-  return a[1] > b[1];
-}
-
-/** Insert a point into a per-tier sorted array, applying worst-of-bucket if
- *  another point already lives in the same bucket. Array stays sorted by ts ASC. */
-function mergeIntoBucket(arr: ChartDataPoint[], pt: ChartDataPoint, bucketWidthMs: number): void {
-  const newBucket = Math.floor(pt[0] / bucketWidthMs);
-  for (let i = 0; i < arr.length; i++) {
-    const b = Math.floor(arr[i][0] / bucketWidthMs);
-    if (b === newBucket) {
-      if (isWorse(pt, arr[i])) arr[i] = pt;
-      return;
-    }
-    if (b > newBucket) {
-      arr.splice(i, 0, pt);
-      return;
-    }
-  }
-  arr.push(pt);
-}
-
-/** Move points from t1→t10→t30→t120 as they age past tier boundaries; drop
- *  points older than 30d from t120. */
-function promoteTiers(svc: ServiceTiers, now: number): void {
-  const limits: Array<
-    [keyof ServiceTiers & ('t1' | 't10' | 't30'), keyof ServiceTiers & ('t10' | 't30' | 't120'), number, number]
-  > = [
-    ['t1', 't10', now - T1_MAX_AGE_MS, T10_BUCKET_MS],
-    ['t10', 't30', now - T10_MAX_AGE_MS, T30_BUCKET_MS],
-    ['t30', 't120', now - T30_MAX_AGE_MS, T120_BUCKET_MS],
-  ];
-  for (const [src, dst, ageLimit, bucketWidth] of limits) {
-    const keep: ChartDataPoint[] = [];
-    const promo: ChartDataPoint[] = [];
-    for (const p of svc[src]) (p[0] < ageLimit ? promo : keep).push(p);
-    svc[src] = keep;
-    for (const p of promo) mergeIntoBucket(svc[dst], p, bucketWidth);
-  }
-  const dropLimit = now - T120_MAX_AGE_MS;
-  svc.t120 = svc.t120.filter(p => p[0] >= dropLimit);
-}
-
-/** Get chart data for all services.
- *
- *  Paid: KV-only — never queries D1. Returns empty {} if state is missing
- *  (fresh deploy before backfill).
- *  Free: assembled from the `uptime_hourly` rollup plus the last 6 h of raw
- *  `checks` rows (two bounded queries; never a full-table scan). */
-export async function getChartData(
-  plan: PlanProfile,
-  kv: KVNamespace | undefined,
-  db: D1Database | undefined,
-): Promise<ChartData> {
-  if (useD1(plan)) return getChartFromRollup(db, plan.historyRetentionDays);
-  if (!kv) return {};
-  const raw = await kv.get(KV_CHART_TIERED_KEY);
-  if (!raw) return {};
-  const state = JSON.parse(raw) as ChartTieredState;
-  const out: ChartData = {};
-  for (const [service, tiers] of Object.entries(state)) {
-    out[service] = [...tiers.t120, ...tiers.t30, ...tiers.t10, ...tiers.t1];
-  }
-  return out;
-}
-
-/** Incrementally update the tiered chart state from fresh HTTPS primary-URL
- *  check results (worst-of-bucket merge into t1, then tier promotion), and
- *  self-backfill from D1 the first time the KV blob is missing. Single KV
- *  read on the steady-state path.
- *
- *  Free: no-op. This blob is the ~2.8 MB one — parsing and re-stringifying it
- *  every tick is exactly what the 10 ms CPU limit forbids. The free path
- *  derives chart data from `uptime_hourly` on read instead. */
-export async function updateChartTiered(
-  plan: PlanProfile,
-  kv: KVNamespace | undefined,
-  db: D1Database | undefined,
-  freshResults: CheckResult[],
-): Promise<void> {
-  if (useD1(plan)) return;
-  if (!kv) return;
-  const raw = await kv.get(KV_CHART_TIERED_KEY);
-  if (raw === null) {
-    if (db) {
-      console.log('Backfilling chart-tiered KV state from D1 (one-time)...');
-      await backfillChartTiered(kv, db);
-    }
-    return;
-  }
-  if (freshResults.length === 0) return;
-  const state = JSON.parse(raw) as ChartTieredState;
-  const now = Date.now();
-
-  for (const r of freshResults) {
-    // A secret service's one direct check is its primary check.
-    if (r.type !== 'https' && r.type !== 'secret') continue;
-    let svc = state[r.service];
-    if (!svc) {
-      svc = state[r.service] = { primaryUrl: r.url, t1: [], t10: [], t30: [], t120: [] };
-    }
-    if (r.url !== svc.primaryUrl) continue;
-    mergeIntoBucket(svc.t1, encodePoint(r), MIN_MS);
-  }
-
-  for (const svc of Object.values(state)) promoteTiers(svc, now);
-
-  await kv.put(KV_CHART_TIERED_KEY, JSON.stringify(state));
-}
-
-/** One-shot D1 → tiered KV state. Called by updateChartTiered when the KV
- *  blob is missing; only runs on first deploy (or recovery if KV state is
- *  lost). Reads ~one chart-query worth of D1 rows; ~$0.01 one-time. */
-export async function backfillChartTiered(kv: KVNamespace, db: D1Database): Promise<void> {
-  const since = Date.now() - HISTORY_RETENTION_MS;
-  const { data, primaryUrls } = await queryChartDataFromDB(db, since);
-  const state: ChartTieredState = {};
-  const now = Date.now();
-  for (const [service, points] of Object.entries(data)) {
-    const tiers: ServiceTiers = { primaryUrl: primaryUrls[service], t1: [], t10: [], t30: [], t120: [] };
-    for (const pt of points) {
-      const age = now - pt[0];
-      if (age < T1_MAX_AGE_MS) tiers.t1.push(pt);
-      else if (age < T10_MAX_AGE_MS) tiers.t10.push(pt);
-      else if (age < T30_MAX_AGE_MS) tiers.t30.push(pt);
-      else tiers.t120.push(pt);
-    }
-    state[service] = tiers;
-  }
-  await kv.put(KV_CHART_TIERED_KEY, JSON.stringify(state));
-}
-
-/** Run the expensive tiered decimation query against D1. Used exclusively by
- *  backfillChartTiered — no longer called from the request path. */
-async function queryChartDataFromDB(
-  db: D1Database,
-  since: number,
-): Promise<{ data: ChartData; primaryUrls: Record<string, string> }> {
-  const now = Date.now();
-  const since6h = now - T1_MAX_AGE_MS;
-  const since2d = now - T10_MAX_AGE_MS;
-  const since7d = now - T30_MAX_AGE_MS;
-
-  const results = await db
-    .prepare(
-      `
-    SELECT service, url, timestamp, latency, status, code, error
-    FROM (
-      SELECT service, url, timestamp, latency, status, code, error,
-        ROW_NUMBER() OVER (
-          PARTITION BY service, url,
-            CASE
-              WHEN timestamp > ?1 THEN CAST(timestamp / 60000 AS INTEGER)
-              WHEN timestamp > ?2 THEN CAST(timestamp / 600000 AS INTEGER)
-              WHEN timestamp > ?3 THEN CAST(timestamp / 1800000 AS INTEGER)
-              ELSE CAST(timestamp / 7200000 AS INTEGER)
-            END
-          ORDER BY
-            CASE WHEN status = 'down' THEN 0 ELSE 1 END,
-            latency DESC
-        ) AS rn
-      FROM checks
-      WHERE timestamp > ?4 AND type IN ('https', 'secret')
-    )
-    WHERE rn = 1
-    ORDER BY service, url, timestamp ASC
-  `,
-    )
-    .bind(since6h, since2d, since7d, since)
-    .all<{
-      service: string;
-      url: string;
-      timestamp: number;
-      latency: number;
-      status: string;
-      code: number | null;
-      error: string | null;
-    }>();
-
-  const grouped: ChartData = {};
-  const primaryUrls: Record<string, string> = {};
-  for (const r of results.results) {
-    if (!primaryUrls[r.service]) {
-      primaryUrls[r.service] = r.url;
-      grouped[r.service] = [];
-    }
-    if (r.url === primaryUrls[r.service]) {
-      const pt: ChartDataPoint = [r.timestamp, r.latency, r.status === 'up' ? 1 : 0];
-      if (r.code) pt.push(r.code);
-      if (r.error) {
-        if (pt.length === 3) pt.push(0);
-        pt.push(r.error);
-      }
-      grouped[r.service].push(pt);
-    }
-  }
-  return { data: grouped, primaryUrls };
 }
 
 // ── Transition timeline (correlation swimlanes) ──────────────────────────────

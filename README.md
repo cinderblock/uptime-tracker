@@ -79,6 +79,11 @@ load scans roughly 6,000 D1 rows. See
 [`migrations/0009_free_plan_rollups.sql`](migrations/0009_free_plan_rollups.sql)
 and [`src/storage-free.ts`](src/storage-free.ts).
 
+On paid, the large blobs hold everything before the current hour and are
+rewritten once an hour; each tick writes only a small blob for the current hour
+([`src/rollups.ts`](src/rollups.ts)). Rewriting the megabyte blobs every tick had
+been most of the cron's CPU.
+
 One consequence worth knowing: chart resolution differs. The paid tiers keep
 1/10/30/120-minute buckets for the primary HTTPS URL of each service. On free,
 anything older than 6 hours comes from the hourly rollup, which has no URL or
@@ -399,7 +404,9 @@ which case the panel stays hidden and no DDNS alerting runs.
 | `config.example.ts`  | What to monitor (copy to `config.ts`)                            |
 | `types.ts`           | Shared interfaces                                                |
 | `checks.ts`          | Check execution, concurrency pool, subrequest budgeting          |
-| `storage.ts`         | D1 + KV access, history, uptime math                             |
+| `storage.ts`         | D1 + KV access, history; dispatches aggregates by plan           |
+| `rollups.ts`         | Paid: chart tiers + uptime counters in KV, hourly fold           |
+| `storage-free.ts`    | Free: aggregates in D1 (`uptime_hourly`, `blobs`)                |
 | `ui.ts`              | Dashboard HTML                                                   |
 | `auth.ts`            | Signed-cookie session auth                                       |
 | `rate-limit.ts`      | Per-IP request limiting for non-admins                           |

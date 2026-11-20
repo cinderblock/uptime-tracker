@@ -40,8 +40,7 @@ import {
   saveCurrentStatus,
   getCurrentStatus,
   addToHistory,
-  updateChartTiered,
-  updateUptimeBuckets,
+  recordRollups,
   cleanupHistory,
   getCheckHistory,
   getChartData,
@@ -65,7 +64,7 @@ import {
   getTransitions,
   updateTransitions,
 } from './storage';
-import { cleanupRollup, rollUpHourly } from './storage-free';
+import { cleanupRollup } from './storage-free';
 import { renderDashboard } from './ui';
 import {
   applyNotifiedChanges,
@@ -227,10 +226,8 @@ async function ensureFreshData(config: DashboardConfig, request: Request, env: E
       lastCheckedTimes.set(r.service, r.timestamp);
     }
   }
+  await recordRollups(plan, env.KV, env.DB, allResults, Date.now());
   await saveCurrentStatus(plan, env.KV, env.DB, panels, lastCheckedTimes);
-  await updateChartTiered(plan, env.KV, env.DB, allResults);
-  await updateUptimeBuckets(plan, env.KV, env.DB, allResults);
-  if (plan.aggregateStore === 'd1') await rollUpHourly(env.DB, allResults, plan.historyRetentionDays);
   console.log(`[dev] Completed ${allResults.length} checks`);
 }
 
@@ -622,21 +619,12 @@ export function createWorker({
         await addToHistory(env.DB, allResults);
         console.log(`Saved ${allResults.length} check results to history`);
 
-        // Paid: incrementally update the durable chart + uptime KV state so the
-        // read path stays D1-free. Worst-of-bucket merge for chart, sum counters
-        // for uptime; both run in a few ms and replace the prior hourly D1 scans.
-        // First call after deploy self-backfills from D1 (one-time ~$0.01).
-        //
-        // Free: those two are no-ops (the blobs are far too large to touch under
-        // a 10 ms CPU limit) and `rollUpHourly` maintains the D1 `uptime_hourly`
-        // table instead — one UPSERT per service per hour, read back on demand.
-        await Promise.all([
-          updateChartTiered(plan, env.KV, env.DB, allResults),
-          updateUptimeBuckets(plan, env.KV, env.DB, allResults),
-          plan.aggregateStore === 'd1'
-            ? rollUpHourly(env.DB, allResults, plan.historyRetentionDays)
-            : Promise.resolve(),
-        ]);
+        // Paid: add this tick to the small per-hour KV blob; the first tick of
+        // each hour folds the finished hour into the large ones (rollups.ts).
+        // Free: `rollUpHourly` upserts the D1 `uptime_hourly` table instead —
+        // the KV blobs are far too large to touch under a 10 ms CPU limit.
+        // Runs before saveCurrentStatus, whose lastUpdate keys the read memo.
+        await recordRollups(plan, env.KV, env.DB, allResults, Date.now());
 
         // Update last-checked times with fresh results, then save status + times to KV (single write)
         for (const r of allResults) {
@@ -1423,13 +1411,13 @@ async function handleDashboard(
   const statusPromise = getCurrentStatus(plan, env.KV, env.DB);
   const generation = statusPromise.then(s => s?.lastUpdate);
   // Start the rest in parallel — the chart query is slow, don't block HTML on it.
-  const chartsPromise = generation.then(g => memo('charts', g, () => getChartData(plan, env.KV, env.DB)));
+  const chartsPromise = generation.then(g => memo('charts', g, () => getChartData(plan, env.KV, env.DB, memo)));
   const transitionsPromise = getTransitions(plan, env.KV, env.DB).then(t => visibleTransitions(t, admin));
   // DDNS (home IPs) and cost data are admin-only, so don't even query them otherwise.
   const [cached, ddnsLog, uptime, costData] = await Promise.all([
     statusPromise,
     admin ? getRecentDdnsLog(plan, env.KV, env.DB, undefined, 50) : [],
-    generation.then(g => memo('uptime', g, () => getMultiPeriodUptime(plan, env.KV, env.DB))),
+    generation.then(g => memo('uptime', g, () => getMultiPeriodUptime(plan, env.KV, env.DB, memo))),
     admin ? fetchCostPanelData(env) : undefined,
   ]);
   const merged = mergeConfigWithStatus(config, cached);
@@ -1504,8 +1492,8 @@ async function handleApiPoll(
     const generation = statusPromise.then(s => s?.lastUpdate);
     const [cached, uptime, charts, ddnsLog, transitions] = await Promise.all([
       statusPromise,
-      generation.then(g => memo('uptime', g, () => getMultiPeriodUptime(plan, env.KV, env.DB))),
-      generation.then(g => memo('charts', g, () => getChartData(plan, env.KV, env.DB))),
+      generation.then(g => memo('uptime', g, () => getMultiPeriodUptime(plan, env.KV, env.DB, memo))),
+      generation.then(g => memo('charts', g, () => getChartData(plan, env.KV, env.DB, memo))),
       admin ? getRecentDdnsLog(plan, env.KV, env.DB, undefined, 50) : [],
       getTransitions(plan, env.KV, env.DB),
     ]);

@@ -23,7 +23,7 @@
  */
 
 import type { CheckResult } from './types';
-import type { ChartData, ChartDataPoint, UptimeByPeriod } from './storage';
+import type { ChartData, ChartDataPoint, UptimeByPeriod } from './rollups';
 
 const MIN_MS = 60_000;
 const HOUR_MS = 60 * MIN_MS;

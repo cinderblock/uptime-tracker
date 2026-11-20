@@ -7,7 +7,8 @@ import type {
   ServiceStatus,
 } from './types';
 import { chartIntervals, type PlanProfile } from './plan';
-import type { ChartData, DdnsLogEntry, UptimeByPeriod } from './storage';
+import type { ChartData, UptimeByPeriod } from './rollups';
+import type { DdnsLogEntry } from './storage';
 import { renderCostPanelHtml, COST_PANEL_CSS, type CostPanelData } from './cost/ui';
 
 /** Format latency for display */
