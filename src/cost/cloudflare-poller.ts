@@ -17,7 +17,9 @@ interface GraphQLResponse<T> {
 interface AnalyticsData {
   viewer: {
     accounts: Array<{
-      workersInvocationsAdaptive: Array<{ sum: { requests: number; subrequests: number; errors: number } }>;
+      workersInvocationsAdaptive: Array<{
+        sum: { requests: number; subrequests: number; errors: number; cpuTimeUs: number };
+      }>;
       d1AnalyticsAdaptiveGroups: Array<{
         sum: { readQueries: number; writeQueries: number; rowsRead: number; rowsWritten: number };
       }>;
@@ -35,7 +37,7 @@ const QUERY = `
           filter: { datetime_geq: $since, datetime_lt: $until }
           limit: 10000
         ) {
-          sum { requests subrequests errors }
+          sum { requests subrequests errors cpuTimeUs }
         }
         d1AnalyticsAdaptiveGroups(
           filter: { datetime_geq: $since, datetime_lt: $until }
@@ -148,6 +150,8 @@ export async function pollCloudflareUsage(
   if (!account) throw new Error('Cloudflare GraphQL: no account in response');
 
   const workersRequests = sumField(account.workersInvocationsAdaptive, 'requests');
+  // Billed per CPU-ms; analytics reports microseconds.
+  const workersCpuMs = sumField(account.workersInvocationsAdaptive, 'cpuTimeUs') / 1000n;
   const d1RowsRead = sumField(account.d1AnalyticsAdaptiveGroups, 'rowsRead');
   const d1RowsWritten = sumField(account.d1AnalyticsAdaptiveGroups, 'rowsWritten');
   const { reads: kvReads, writes: kvWrites } = bucketKvOps(account.kvOperationsAdaptiveGroups);
@@ -168,6 +172,7 @@ export async function pollCloudflareUsage(
     });
   };
   push('workers.requests', workersRequests);
+  push('workers.cpu_ms', workersCpuMs);
   push('d1.rows_read', d1RowsRead);
   push('d1.rows_written', d1RowsWritten);
   push('kv.reads', kvReads);
